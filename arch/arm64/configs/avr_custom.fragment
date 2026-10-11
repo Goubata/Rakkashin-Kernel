@@ -1,0 +1,30 @@
+# avr custom kernel: KernelSU-Next + SUSFS + KMI-safe power/perf tweaks
+# Everything here must stay KMI-neutral so the stock vendor_dlkm/system_dlkm
+# modules keep loading.
+
+# --- root / hiding ---
+CONFIG_KSU=y
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_MAP=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+# susfs logs every hidden-path hit via printk by default: wasted CPU wakeups
+# and an easy detection vector in dmesg.
+# CONFIG_KSU_SUSFS_ENABLE_LOG is not set
+
+# --- power ---
+# Let WQ_POWER_EFFICIENT workqueues run unbound so the scheduler can keep
+# work on already-awake CPUs instead of waking idle ones.
+CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y
+
+# --- network ---
+# BBR copes much better with lossy/variable cellular & Wi-Fi links than CUBIC
+# (fewer retransmits, lower latency under load). Uses internal pacing; FQ is
+# already built in.
+CONFIG_TCP_CONG_BBR=y
+CONFIG_DEFAULT_BBR=y
