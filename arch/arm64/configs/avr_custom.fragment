@@ -32,3 +32,9 @@ CONFIG_DEFAULT_BBR=y
 # CONFIG_TCP_CONG_BIC is not set
 # CONFIG_TCP_CONG_HTCP is not set
 # CONFIG_TCP_CONG_WESTWOOD is not set
+
+# --- stock module compatibility ---
+# Trust the stock GKI build's module signing cert (extracted from the stock
+# boot.img), so Google-signed system_dlkm modules count as signed GKI modules
+# rather than vendor modules restricted to the KMI symbol list.
+CONFIG_SYSTEM_TRUSTED_KEYS="certs/avr_stock_gki_module_key.x509.pem"
