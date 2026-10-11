@@ -26,5 +26,9 @@ CONFIG_WQ_POWER_EFFICIENT_DEFAULT=y
 # BBR copes much better with lossy/variable cellular & Wi-Fi links than CUBIC
 # (fewer retransmits, lower latency under load). Uses internal pacing; FQ is
 # already built in.
+CONFIG_TCP_CONG_ADVANCED=y
 CONFIG_TCP_CONG_BBR=y
 CONFIG_DEFAULT_BBR=y
+# CONFIG_TCP_CONG_BIC is not set
+# CONFIG_TCP_CONG_HTCP is not set
+# CONFIG_TCP_CONG_WESTWOOD is not set
