@@ -1,0 +1,349 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rakkashin Kernel</title>
+<style>
+  :root { --bg:#f5f5f7; --card:#fff; --fg:#1d1d1f; --sub:#6e6e73; --line:#d2d2d7; --acc:#e0457b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#000; --card:#1c1c1e; --fg:#f5f5f7; --sub:#98989d; --line:#38383a; --acc:#ff5c93; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+         font:15px/1.45 system-ui, -apple-system, "Noto Sans JP", sans-serif; }
+  header { margin:4px 0 16px; }
+  h1 { font-size:22px; margin:0; letter-spacing:.02em; }
+  h1 span { color:var(--acc); }
+  h2 { font-size:16px; margin:0 0 10px; }
+  .sub { color:var(--sub); font-size:13px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  .modes { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  button.mode { text-align:left; padding:12px; border-radius:12px; border:2px solid var(--line);
+                background:transparent; color:var(--fg); font:inherit; cursor:pointer; }
+  button.mode b { display:block; font-size:16px; }
+  button.mode span { color:var(--sub); font-size:13px; }
+  button.mode.on { border-color:var(--acc); }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:6px 0; }
+  .row + .row { border-top:1px solid var(--line); }
+  input[type=checkbox] { width:22px; height:22px; flex:none; accent-color:var(--acc); }
+  #status { min-height:1.4em; margin:10px 0 0; }
+  .wl { font-size:13px; }
+  .wl .name { word-break:break-all; }
+  .wl .meta { color:var(--sub); font-variant-numeric:tabular-nums; }
+  button.link { background:none; border:0; color:var(--acc); font:inherit; padding:0; cursor:pointer; }
+  select { font:inherit; color:var(--fg); background:var(--bg); border:1px solid var(--line);
+           border-radius:8px; padding:4px 6px; flex:none; }
+  select.set { border-color:var(--acc); }
+  #now { margin:0 0 10px; }
+  #appfilter { width:100%; font:inherit; color:var(--fg); background:var(--bg);
+               border:1px solid var(--line); border-radius:10px; padding:8px 10px; margin-bottom:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>Rakkashin</span> Kernel</h1>
+  <div class="sub" id="ver"></div>
+</header>
+
+<div class="card">
+  <h2 data-i18n="profile"></h2>
+  <p class="sub" id="now"></p>
+  <div class="modes" id="modes"></div>
+  <p class="sub" id="status"></p>
+  <p class="sub" id="caps"></p>
+</div>
+
+<div class="card">
+  <div class="row" style="padding-top:0">
+    <h2 data-i18n="apps_title" style="margin:0"></h2>
+    <input type="checkbox" id="perapp">
+  </div>
+  <p class="sub" data-i18n="apps_desc"></p>
+  <input id="appfilter" type="search">
+  <div id="apps"></div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div><b data-i18n="lb_title"></b><div class="sub" data-i18n="lb_desc"></div></div>
+    <input type="checkbox" id="lb">
+  </div>
+  <div class="row">
+    <div><b data-i18n="tb_title"></b><div class="sub" data-i18n="tb_desc"></div></div>
+    <input type="checkbox" id="tb">
+  </div>
+  <div class="row">
+    <div><b data-i18n="z_title"></b><div class="sub" data-i18n="z_desc"></div></div>
+    <input type="checkbox" id="zram2">
+  </div>
+  <div class="row">
+    <div><b>fsync</b><div class="sub" data-i18n="fsync_desc"></div></div>
+    <input type="checkbox" id="fsync">
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="padding-top:0">
+    <h2 data-i18n="wl_title" style="margin:0"></h2>
+    <button class="link" id="wlreload" data-i18n="reload"></button>
+  </div>
+  <p class="sub" data-i18n="wl_desc"></p>
+  <div id="wl"></div>
+</div>
+
+<script>
+// Japanese UI only when the system language is Japanese; English otherwise.
+const LANG = (navigator.language || "en").toLowerCase().startsWith("ja") ? "ja" : "en";
+const T = {
+  ja: {
+    profile: "全体のプロファイル",
+    apps_title: "アプリごとのプロファイル",
+    apps_desc: "設定したアプリが前面にある間だけ、そのプロファイルに切り替わります。離れると全体のプロファイルに戻ります。",
+    filter: "アプリを検索",
+    use_global: "全体に従う",
+    now_global: "現在: 全体のプロファイル",
+    now_app: (m, a) => `現在: ${m}（${a} のアプリ設定）`,
+    saved: "保存しました",
+    battery: ["バッテリー", "電力効率の良い周波数まで・裏アプリを強く制限"],
+    caps: "バッテリーモードの上限周波数",
+    balanced: ["バランス", "標準（初期値）"],
+    performance: ["パフォーマンス", "周波数下限30%・反応速め・スレッドブースト+15%"],
+    game: ["ゲーム", "下限50%・前面アプリ優先・スレッドブースト+25%"],
+    z_title: "zram 2段圧縮",
+    z_desc: "普段は速い lzo-rle で圧縮し、30分使われなかったデータだけ zstd で詰め直します。より多くのアプリを RAM に残せます。切り替えは再起動後に反映されます。",
+    z_saved: "保存しました（再起動後に反映されます）",
+    tb_title: "スレッドブースト",
+    tb_desc: "パフォーマンスとゲームで、前面アプリの重いスレッド4本に、負荷より多めの性能を先回りで保証します。",
+    switched: "切り替えました（再起動後も保持されます）",
+    failed: "失敗しました: ",
+    unsupported: "このカーネルは Rakkashin Kernel ではありません。",
+    lb_title: "アプリ起動ブースト",
+    lb_desc: "アプリの起動直後、1秒だけ CPU を全開にします。プロファイルを切り替えると、そのプロファイルの既定値に戻ります。",
+    fsync_desc: "オフにすると書き込みが速くなりますが、突然の電源断でデータが壊れることがあります。",
+    wl_title: "Wakelock",
+    wl_desc: "スリープを妨げている時間が長い順です。チェックした wakelock はブロックされます。通知や通信に必要なものを止めると不具合が出ることがあります。",
+    reload: "再読み込み",
+    blocked: "ブロック設定を保存しました",
+    count: "回",
+  },
+  en: {
+    profile: "Global profile",
+    apps_title: "Per-app profiles",
+    apps_desc: "While an app with its own profile is in the foreground, that profile applies. Leaving it returns to the global profile.",
+    filter: "Search apps",
+    use_global: "Use global",
+    now_global: "Now: global profile",
+    now_app: (m, a) => `Now: ${m} (app profile for ${a})`,
+    saved: "Saved",
+    battery: ["Battery", "Capped at the efficient frequency, background apps heavily limited"],
+    caps: "Battery mode frequency caps",
+    balanced: ["Balanced", "Default"],
+    performance: ["Performance", "30% frequency floor, faster response, thread boost +15%"],
+    game: ["Game", "50% floor, foreground first, thread boost +25%"],
+    z_title: "Two-stage zram",
+    z_desc: "Swaps with fast lzo-rle, then re-packs data untouched for 30 minutes with zstd, so more apps stay in RAM. Takes effect after a reboot.",
+    z_saved: "Saved (takes effect after a reboot)",
+    tb_title: "Thread boost",
+    tb_desc: "In Performance and Game, gives the 4 heaviest foreground threads more capacity than their current load, ahead of spikes.",
+    switched: "Switched (kept across reboots)",
+    failed: "Failed: ",
+    unsupported: "This kernel is not Rakkashin Kernel.",
+    lb_title: "App launch boost",
+    lb_desc: "Runs the CPU flat out for 1 second right after an app starts. Switching profiles resets it to that profile's default.",
+    fsync_desc: "Off makes writes faster, but a sudden power loss can corrupt data.",
+    wl_title: "Wakelocks",
+    wl_desc: "Sorted by how long each kept the phone awake. Checked wakelocks are blocked. Blocking ones needed for notifications or networking can break things.",
+    reload: "Reload",
+    blocked: "Block list saved",
+    count: "x",
+  },
+}[LANG];
+document.documentElement.lang = LANG;
+document.querySelectorAll("[data-i18n]").forEach((e) => { e.textContent = T[e.dataset.i18n]; });
+document.getElementById("appfilter").placeholder = T.filter;
+
+const MODDIR = "/data/adb/modules/rakkashin";
+const STATE = "/data/adb/rakkashin";
+const NODE = "/sys/kernel/avr_profile";
+const FSYNC = "/sys/module/sync/parameters/fsync_enabled";
+const LB = "/sys/module/launch_boost/parameters/enabled";
+const TB = "/sys/module/rk_tboost/parameters/enabled";
+const WLB = "/sys/class/misc/boeffla_wakelock_blocker/wakelock_blocker";
+const MODES = ["battery", "balanced", "performance", "game"];
+
+// KernelSU WebUI bridge: ksu.exec(cmd, optionsJson, callbackName)
+function exec(cmd) {
+  return new Promise((resolve) => {
+    const cb = "cb_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+    window[cb] = (errno, stdout, stderr) => { delete window[cb]; resolve({ errno, stdout, stderr }); };
+    ksu.exec(cmd, "{}", cb);
+  });
+}
+const status = (t) => { document.getElementById("status").textContent = t; };
+const q = (s) => "'" + String(s).replace(/'/g, "'\\''") + "'";
+
+function renderModes(current) {
+  const box = document.getElementById("modes");
+  box.replaceChildren();
+  for (const id of MODES) {
+    const b = document.createElement("button");
+    b.className = "mode" + (id === current ? " on" : "");
+    const t = document.createElement("b"); t.textContent = T[id][0];
+    const d = document.createElement("span"); d.textContent = T[id][1];
+    b.append(t, d);
+    b.onclick = () => setMode(id);
+    box.append(b);
+  }
+}
+
+// global (user-chosen) mode and what is in effect right now
+let uidToPkg = {};
+async function readMode() {
+  const r = await exec(`cat ${NODE}/status`);
+  const kv = Object.fromEntries(r.stdout.trim().split(" ").map((x) => x.split("=")));
+  const now = document.getElementById("now");
+  now.textContent = kv.app && kv.app !== "-"
+    ? T.now_app(T[kv.active][0], uidToPkg[kv.app] || kv.app)
+    : T.now_global;
+  return kv.global || null;
+}
+
+async function readToggles() {
+  const [f, l, tb] = await Promise.all([exec(`cat ${FSYNC}`), exec(`cat ${LB}`), exec(`cat ${TB}`)]);
+  document.getElementById("fsync").checked = f.stdout.trim() === "Y";
+  document.getElementById("lb").checked = l.stdout.trim() === "Y";
+  document.getElementById("tb").checked = tb.stdout.trim() === "Y";
+}
+
+async function setMode(id) {
+  const r = await exec(`sh ${MODDIR}/apply.sh ${id}`);
+  if (r.errno !== 0) { status(T.failed + r.stderr); return; }
+  renderModes(await readMode());
+  await readToggles();
+  status(T.switched);
+}
+
+function bindToggle(elId, node, stateFile) {
+  document.getElementById(elId).onchange = async (e) => {
+    const v = e.target.checked ? "Y" : "N";
+    await exec(`echo ${v} > ${node} && mkdir -p ${STATE} && echo ${v} > ${STATE}/${stateFile}`);
+  };
+}
+
+async function loadWakelocks() {
+  const list = await exec(
+    `for d in /sys/class/wakeup/*; do printf '%s\\t%s\\t%s\\n' "$(cat $d/name)" "$(cat $d/total_time_ms)" "$(cat $d/active_count)"; done 2>/dev/null | sort -t "$(printf '\\t')" -k2,2nr | head -40`);
+  const cur = (await exec(`cat ${WLB}`)).stdout.trim();
+  const blocked = new Set(cur.split(";").filter(Boolean));
+  const box = document.getElementById("wl");
+  box.replaceChildren();
+  for (const line of list.stdout.split("\n")) {
+    const [name, ms, cnt] = line.split("\t");
+    if (!name) continue;
+    const row = document.createElement("label");
+    row.className = "row wl";
+    const left = document.createElement("div");
+    const n = document.createElement("div"); n.className = "name"; n.textContent = name;
+    const m = document.createElement("div"); m.className = "meta";
+    m.textContent = `${(Number(ms) / 1000).toFixed(1)} s · ${cnt}${T.count}`;
+    left.append(n, m);
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = blocked.has(name);
+    cb.onchange = async () => {
+      cb.checked ? blocked.add(name) : blocked.delete(name);
+      const v = [...blocked].join(";");
+      await exec(`echo ${q(v)} > ${WLB} && mkdir -p ${STATE} && echo ${q(v)} > ${STATE}/wl_block`);
+      status(T.blocked);
+    };
+    row.append(left, cb);
+    box.append(row);
+  }
+}
+
+// ---- per-app profiles ----
+let profiles = new Map();	// uid -> mode
+async function saveProfiles() {
+  const v = [...profiles].map(([u, m]) => `${u}:${m}`).join(" ");
+  const r = await exec(`echo ${q(v)} > ${NODE}/app_profiles && mkdir -p ${STATE} && echo ${q(v)} > ${STATE}/app_profiles`);
+  status(r.errno === 0 ? T.saved : T.failed + r.stderr);
+  readMode();
+}
+
+async function loadApps() {
+  const [pk, cur, pa] = await Promise.all([
+    exec("pm list packages -3 -U"), exec(`cat ${NODE}/app_profiles`), exec(`cat ${NODE}/per_app`)]);
+  document.getElementById("perapp").checked = pa.stdout.trim() === "1";
+  profiles = new Map(cur.stdout.trim().split(/\s+/).filter(Boolean).map((t) => t.split(":")));
+  const apps = [];
+  for (const line of pk.stdout.split("\n")) {
+    const m = line.match(/^package:(\S+) uid:(\d+)/);
+    if (m) { apps.push({ pkg: m[1], uid: m[2] }); uidToPkg[m[2]] = m[1]; }
+  }
+  // apps with a profile first, then alphabetical
+  apps.sort((a, b) => (profiles.has(b.uid) - profiles.has(a.uid)) || a.pkg.localeCompare(b.pkg));
+  const box = document.getElementById("apps");
+  box.replaceChildren();
+  for (const a of apps) {
+    const row = document.createElement("div");
+    row.className = "row wl"; row.dataset.pkg = a.pkg;
+    const n = document.createElement("div"); n.className = "name"; n.textContent = a.pkg;
+    const sel = document.createElement("select");
+    for (const v of ["", ...MODES]) {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = v ? T[v][0] : T.use_global;
+      sel.append(o);
+    }
+    sel.value = profiles.get(a.uid) || "";
+    sel.classList.toggle("set", !!sel.value);
+    sel.onchange = () => {
+      sel.value ? profiles.set(a.uid, sel.value) : profiles.delete(a.uid);
+      sel.classList.toggle("set", !!sel.value);
+      saveProfiles();
+    };
+    row.append(n, sel);
+    box.append(row);
+  }
+  readMode();
+}
+
+async function init() {
+  const v = await exec(`cat ${NODE}/version`);
+  if (v.errno !== 0) { status(T.unsupported); return; }
+  document.getElementById("ver").textContent = v.stdout.trim();
+  renderModes(await readMode());
+  await readToggles();
+  const caps = await exec(`cat ${NODE}/battery_caps`);
+  if (caps.errno === 0)
+    document.getElementById("caps").textContent = T.caps + ": " +
+      caps.stdout.trim().split("\n").map((l) => {
+        const m = l.match(/^(cpu\d+): (\d+)\/(\d+) kHz \((\S+)\)/);
+        return m ? `${m[1]} ${(m[2] / 1e6).toFixed(2)}/${(m[3] / 1e6).toFixed(2)} GHz${m[4] === "fallback" ? " (70%)" : ""}` : l;
+      }).join(" · ");
+  bindToggle("fsync", FSYNC, "fsync");
+  bindToggle("lb", LB, "launch_boost");
+  bindToggle("tb", TB, "tboost");
+  const z = document.getElementById("zram2");
+  z.checked = (await exec(`cat ${STATE}/zram2 2>/dev/null`)).stdout.trim() !== "0";
+  z.onchange = async () => {
+    await exec(`mkdir -p ${STATE} && echo ${z.checked ? 1 : 0} > ${STATE}/zram2`);
+    status(T.z_saved);
+  };
+  document.getElementById("perapp").onchange = async (e) => {
+    const v = e.target.checked ? 1 : 0;
+    await exec(`echo ${v} > ${NODE}/per_app && mkdir -p ${STATE} && echo ${v} > ${STATE}/per_app`);
+    readMode();
+  };
+  document.getElementById("appfilter").oninput = (e) => {
+    const f = e.target.value.toLowerCase();
+    for (const r of document.querySelectorAll("#apps .row"))
+      r.style.display = r.dataset.pkg.toLowerCase().includes(f) ? "" : "none";
+  };
+  loadApps();
+  document.getElementById("wlreload").onclick = loadWakelocks;
+  loadWakelocks();
+}
+init();
+</script>
+</body>
+</html>

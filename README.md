@@ -1,156 +1,104 @@
-# How do I submit patches to Android Common Kernels
+# Rakkashin Kernel
 
-1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
-   These patches will be merged automatically in the corresponding common kernels. If the patch is already
-   in upstream Linux, post a backport of the patch that conforms to the patch requirements below.
-   - Do not send patches upstream that contain only symbol exports. To be considered for upstream Linux,
-additions of `EXPORT_SYMBOL_GPL()` require an in-tree modular driver that uses the symbol -- so include
-the new driver or changes to an existing driver in the same patchset as the export.
-   - When sending patches upstream, the commit message must contain a clear case for why the patch
-is needed and beneficial to the community. Enabling out-of-tree drivers or functionality is not
-a persuasive case.
+Custom GKI kernel for **avr / avr_retcn** (Android 16, `android16-6.12`, 6.12.58)
+with KernelSU-Next and a set of performance, efficiency and battery features,
+controlled from a KernelSU WebUI.
 
-2. LESS GOOD: Develop your patches out-of-tree (from an upstream Linux point-of-view). Unless these are
-   fixing an Android-specific bug, these are very unlikely to be accepted unless they have been
-   coordinated with kernel-team@android.com. If you want to proceed, post a patch that conforms to the
-   patch requirements below.
+by **Rakkashin**
 
-# Common Kernel patch requirements
+> 日本語の説明は[下](#日本語)にあります。
 
-- All patches must conform to the Linux kernel coding standards and pass `scripts/checkpatch.pl`
-- Patches shall not break gki_defconfig or allmodconfig builds for arm, arm64, x86, x86_64 architectures
-(see  https://source.android.com/setup/build/building-kernels)
-- If the patch is not merged from an upstream branch, the subject must be tagged with the type of patch:
-`UPSTREAM:`, `BACKPORT:`, `FROMGIT:`, `FROMLIST:`, or `ANDROID:`.
-- All patches must have a `Change-Id:` tag (see https://gerrit-review.googlesource.com/Documentation/user-changeid.html)
-- If an Android bug has been assigned, there must be a `Bug:` tag.
-- All patches must have a `Signed-off-by:` tag by the author and the submitter
+## Features
 
-Additional requirements are listed below based on patch type
+**Root**
+- KernelSU-Next v3.4.1 (no SUSFS: it broke Chrome and every WebUI on this device)
 
-## Requirements for backports from mainline Linux: `UPSTREAM:`, `BACKPORT:`
+**Profiles** — `/sys/kernel/avr_profile/mode`, switched from the WebUI
 
-- If the patch is a cherry-pick from Linux mainline with no changes at all
-    - tag the patch subject with `UPSTREAM:`.
-    - add upstream commit information with a `(cherry picked from commit ...)` line
-    - Example:
-        - if the upstream commit message is
-```
-        important patch from upstream
+| | CPU frequency | PELT | Launch boost | Thread boost | Writeback | Background apps |
+|---|---|---|---|---|---|---|
+| battery | capped at the Energy Model efficiency knee | 32 ms | off | off | 30 s | heavily limited |
+| balanced | stock | 16 ms | on | off | 15 s | stock |
+| performance | floor 30% | 8 ms | on | +15% | 15 s | stock |
+| game | floor 50% | 8 ms | on | +25% | 15 s | limited |
 
-        This is the detailed description of the important patch
+- **Per-app profiles**: give any app its own profile; it applies while that app
+  is in the foreground (decided in-kernel on cpuset attach, no polling).
+- **Thread boost**: the heaviest foreground threads get a uclamp floor of
+  their load plus headroom, so frequency is already up when frame work spikes.
+- **App launch boost**: a freshly started app runs flat out for 1 s.
+- **Battery caps** come from the Energy Model: the highest frequency whose
+  energy cost is within 25% of the most efficient state (50–85% of max).
+- CPU limits use cpufreq frequency QoS, so thermal limits always win.
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
->- then Joe Smith would upload the patch for the common kernel as
-```
-        UPSTREAM: important patch from upstream
+**Memory**
+- Two-stage zram: lzo-rle for speed, idle pages re-packed with zstd every 30 min
+- Earlier kswapd (`watermark_scale_factor` 50), no watermark boost,
+  no swap readahead on zram, `vfs_cache_pressure` 50
 
-        This is the detailed description of the important patch
+**Battery / latency**
+- Boeffla wakelock blocker (RCU rewrite), with a wakelock list in the WebUI
+- vmstat every 20 s, I/O stats and binder logging off, no fs sync on suspend,
+  15 s writeback, power-efficient workqueues
+- TCP BBR, no slow start after idle, `tcp_notsent_lowat` 128K
+- Tuned for the Oryon cores (`-mtune=oryon-1`)
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+**Compatibility**
+- KMI-safe: export CRCs match the stock GKI, and the stock GKI module
+  signing certificate is trusted, so stock vendor and system_dlkm modules load.
+- `uname -r` reports the stock release string.
 
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry picked from commit c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+Ported ideas from AGNi, NGK, Melt and LawRun; original work for the profiles,
+per-app switching, thread boost, launch boost and efficiency caps.
 
-- If the patch requires any changes from the upstream version, tag the patch with `BACKPORT:`
-instead of `UPSTREAM:`.
-    - use the same tags as `UPSTREAM:`
-    - add comments about the changes under the `(cherry picked from commit ...)` line
-    - Example:
-```
-        BACKPORT: important patch from upstream
+## Install
 
-        This is the detailed description of the important patch
+1. Uninstall any older control module (`avr Profile Switcher`).
+2. Flash `Rakkashin-Kernel-*-avr-AnyKernel3.zip` from the KernelSU-Next app
+   (or `fastboot flash boot Rakkashin-Kernel-*-avr-boot.img`; the boot image
+   is built for firmware W3WWL36.65-11-18 only).
+3. Install `Rakkashin-Kernel-Control-*.zip` as a module and reboot.
+4. Open the module's WebUI.
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+Keep your stock `boot.img` to roll back with fastboot.
 
-        Bug: 135791357
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        (cherry picked from commit c31e73121f4c1ec41143423ac6ce3ce6dafdcec1)
-        [joe: Resolved minor conflict in drivers/foo/bar.c ]
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
+## Build
+
+```sh
+. rakkashin/build-env.sh /path/to/out
+make -C $KSRC O=$KOUT gki_defconfig   # then merge arch/arm64/configs/avr_custom.fragment
+make -C $KSRC O=$KOUT -j$(nproc) \
+     CLANG_AUTOFDO_PROFILE=$KSRC/gki/aarch64/afdo/kernel.afdo Image
 ```
 
-## Requirements for other backports: `FROMGIT:`, `FROMLIST:`,
+`KBUILD_GENDWARFKSYMS_STABLE=1` (set by `build-env.sh`) is required: without it
+symbol CRCs differ from the stock GKI and the phone will not boot. LTO must stay
+off (`GENDWARFKSYMS` depends on `!LTO`). `rakkashin/repack_boot.py` swaps the
+kernel into a stock boot image and refreshes its AVB hash footer.
 
-- If the patch has been merged into an upstream maintainer tree, but has not yet
-been merged into Linux mainline
-    - tag the patch subject with `FROMGIT:`
-    - add info on where the patch came from as `(cherry picked from commit <sha1> <repo> <branch>)`. This
-must be a stable maintainer branch (not rebased, so don't use `linux-next` for example).
-    - if changes were required, use `BACKPORT: FROMGIT:`
-    - Example:
-        - if the commit message in the maintainer tree is
-```
-        important patch from upstream
+Sources: `rakkashin/control-module/` (WebUI module),
+`kernel/avr_profile.c`, `kernel/rk_tboost.c`, `kernel/launch_boost.c`,
+`drivers/base/power/boeffla_wl_blocker.c`.
 
-        This is the detailed description of the important patch
+## License
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-```
->- then Joe Smith would upload the patch for the common kernel as
-```
-        FROMGIT: important patch from upstream
+GPL-2.0, like the Linux kernel. See `COPYING`.
 
-        This is the detailed description of the important patch
+---
 
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
+## 日本語
 
-        Bug: 135791357
-        (cherry picked from commit 878a2fd9de10b03d11d2f622250285c7e63deace
-         https://git.kernel.org/pub/scm/linux/kernel/git/foo/bar.git test-branch)
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
+avr / avr_retcn 向けのカスタム GKI カーネルです（Android 16、6.12.58）。
+KernelSU-Next と、性能・効率・電池持ちのための独自機能を入れています。
+設定は KernelSU の WebUI から行います。
 
+- **プロファイル**: バッテリー / バランス / パフォーマンス / ゲームを切り替えます。
+- **アプリごとのプロファイル**: 設定したアプリが前面にある間だけ、そのプロファイルになります。
+- **スレッドブースト**: 前面アプリの重いスレッドに、先回りで性能の余裕を与えます。
+- **起動ブースト**: アプリの起動直後の1秒だけ、CPU を全開にします。
+- **zram 2段圧縮**: 速い lzo-rle と、詰め込みの zstd を組み合わせます。
+- **wakelock ブロック**: WebUI の一覧から選べます。
 
-- If the patch has been submitted to LKML, but not accepted into any maintainer tree
-    - tag the patch subject with `FROMLIST:`
-    - add a `Link:` tag with a link to the submittal on lore.kernel.org
-    - add a `Bug:` tag with the Android bug (required for patches not accepted into
-a maintainer tree)
-    - if changes were required, use `BACKPORT: FROMLIST:`
-    - Example:
-```
-        FROMLIST: important patch from upstream
+**インストール**: 上の Install の手順と同じです。純正の `boot.img` は必ず保存しておいてください。
 
-        This is the detailed description of the important patch
-
-        Signed-off-by: Fred Jones <fred.jones@foo.org>
-
-        Bug: 135791357
-        Link: https://lore.kernel.org/lkml/20190619171517.GA17557@someone.com/
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
-
-- If a patch has been submitted to the community, but rejected, do NOT use the
-  `FROMLIST:` tag to try to hide this fact.  Use the `ANDROID:` tag as
-  described below as this must be considered as an Android-specific submission,
-  not an upstream submission as the community will not accept these changes
-  as-is.
-
-## Requirements for Android-specific patches: `ANDROID:`
-
-- If the patch is fixing a bug to Android-specific code
-    - tag the patch subject with `ANDROID:`
-    - add a `Fixes:` tag that cites the patch with the bug
-    - Example:
-```
-        ANDROID: fix android-specific bug in foobar.c
-
-        This is the detailed description of the important fix
-
-        Fixes: 1234abcd2468 ("foobar: add cool feature")
-        Change-Id: I4caaaa566ea080fa148c5e768bb1a0b6f7201c01
-        Signed-off-by: Joe Smith <joe.smith@foo.org>
-```
-
-- If the patch is a new feature
-    - tag the patch subject with `ANDROID:`
-    - add a `Bug:` tag with the Android bug (required for android-specific features)
-
+作者: **Rakkashin**
