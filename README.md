@@ -50,7 +50,9 @@ by **Rakkashin**
 **Memory**
 - Keep more apps in RAM: lmkd tuned for 16GB, up to 64 cached apps
 - Two-stage zram: lz4 for speed (zram built in with an LZ4 backend; the stock
-  module only has lzo/zstd), idle pages re-packed with zstd every 30 min
+  module only has lzo/zstd), idle pages re-packed with zstd every 30 min.
+  Every zram device is created with zstd as its recompression algorithm, so
+  this works on a live swap device and alongside other zram tools.
 - Earlier kswapd (`watermark_scale_factor` 50), no watermark boost,
   no swap readahead on zram, `vfs_cache_pressure` 50
 

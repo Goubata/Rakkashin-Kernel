@@ -44,6 +44,22 @@ static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
 static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
+/*
+ * avr: give every zram device zstd as its recompression algorithm from the
+ * start, so idle pages can be re-packed without resetting a live swap device
+ * (recomp_algorithm can't be changed once the device is initialised).
+ */
+#if IS_ENABLED(CONFIG_ZRAM_MULTI_COMP) && IS_ENABLED(CONFIG_ZRAM_BACKEND_ZSTD)
+static const char *default_recompressor = "zstd";
+#else
+static const char *default_recompressor;
+#endif
+
+/* algorithm names that point at the static defaults above must not be freed */
+static bool zram_static_alg(const char *alg)
+{
+	return alg == default_compressor || alg == default_recompressor;
+}
 
 /* Module params (documentation at end) */
 static unsigned int num_devices = 1;
@@ -1197,7 +1213,7 @@ static ssize_t max_comp_streams_store(struct device *dev,
 static void comp_algorithm_set(struct zram *zram, u32 prio, const char *alg)
 {
 	/* Do not free statically defined compression algorithms */
-	if (zram->comp_algs[prio] != default_compressor)
+	if (!zram_static_alg(zram->comp_algs[prio]))
 		kfree(zram->comp_algs[prio]);
 
 	zram->comp_algs[prio] = alg;
@@ -2428,7 +2444,7 @@ static void zram_destroy_comps(struct zram *zram)
 
 	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++) {
 		/* Do not free statically defined compression algorithms */
-		if (zram->comp_algs[prio] != default_compressor)
+		if (!zram_static_alg(zram->comp_algs[prio]))
 			kfree(zram->comp_algs[prio]);
 		zram->comp_algs[prio] = NULL;
 	}
@@ -2454,6 +2470,8 @@ static void zram_reset_device(struct zram *zram)
 	reset_bdev(zram);
 
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
+	if (default_recompressor)
+		comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, default_recompressor);
 	up_write(&zram->init_lock);
 }
 
@@ -2692,6 +2710,8 @@ static int zram_add(void)
 	atomic_set(&zram->pp_in_progress, 0);
 	zram_comp_params_reset(zram);
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
+	if (default_recompressor)
+		comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, default_recompressor);
 
 	/* Actual capacity set using sysfs (/sys/block/zram<id>/disksize */
 	set_capacity(zram->disk, 0);
