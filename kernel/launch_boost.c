@@ -3,9 +3,14 @@
  * App launch boost (avr).
  *
  * When zygote specializes a fork into an app (setresuid from root to an
- * app UID), give that first thread a uclamp.min floor for a short window so
- * the cold start runs on fast cores at high frequency from the first
- * instruction, before the framework's own hints arrive.
+ * app UID), give that first thread a uclamp.min floor so the cold start runs
+ * on fast cores at high frequency from the first instruction, before the
+ * framework's own hints arrive.
+ *
+ * The window is adaptive: after min_ms the thread's PELT utilization is
+ * polled every POLL_MS, and the boost ends once it stays below settle_util
+ * for two polls in a row (launch work done), or at max_ms at the latest.
+ * Heavy apps keep it for as long as they need, light apps give it back early.
  *
  * The boost is not inherited: SCHED_FLAG_RESET_ON_FORK is set for the
  * window, so threads created during launch (RenderThread, binder threads,
@@ -14,7 +19,9 @@
  * clamp meanwhile, in which case it is left alone.
  *
  *   /sys/module/launch_boost/parameters/enabled      (default Y)
- *   /sys/module/launch_boost/parameters/duration_ms  (default 1000)
+ *   /sys/module/launch_boost/parameters/min_ms       (default 300)
+ *   /sys/module/launch_boost/parameters/max_ms       (default 2000)
+ *   /sys/module/launch_boost/parameters/settle_util  (0..1024, default 150)
  *   /sys/module/launch_boost/parameters/uclamp_min   (0..1024, default 1024)
  */
 
@@ -37,8 +44,16 @@
 static bool enabled = true;
 module_param(enabled, bool, 0644);
 
-static unsigned int duration_ms = 1000;
-module_param(duration_ms, uint, 0644);
+#define POLL_MS		100
+
+static unsigned int min_ms = 300;
+module_param(min_ms, uint, 0644);
+
+static unsigned int max_ms = 2000;
+module_param(max_ms, uint, 0644);
+
+static unsigned int settle_util = 150;
+module_param(settle_util, uint, 0644);
 
 static unsigned int uclamp_min = SCHED_CAPACITY_SCALE;
 module_param(uclamp_min, uint, 0644);
@@ -54,6 +69,8 @@ struct launch_boost {
 	unsigned int boost;
 	unsigned int orig_min;
 	bool orig_reset_on_fork;
+	unsigned long start;	/* jiffies */
+	unsigned int quiet;	/* consecutive polls below settle_util */
 };
 
 static int set_clamp(struct task_struct *p, unsigned int min, bool reset_on_fork)
@@ -72,15 +89,31 @@ static int set_clamp(struct task_struct *p, unsigned int min, bool reset_on_fork
 	return sched_setattr_nocheck(p, &attr);
 }
 
-static void launch_boost_end(struct work_struct *work)
+static void launch_boost_poll(struct work_struct *work)
 {
 	struct launch_boost *lb = container_of(to_delayed_work(work),
 					       struct launch_boost, work);
 	struct task_struct *p = lb->p;
+	unsigned long age = jiffies - lb->start;
+	/* uclamp_req is a bitfield; a racy read only risks a late decision */
+	bool ours = p->uclamp_req[UCLAMP_MIN].value == lb->boost;
 
-	/* uclamp_req is a bitfield; a racy read only risks skipping the restore */
-	if (!(p->flags & PF_EXITING) &&
-	    p->uclamp_req[UCLAMP_MIN].value == lb->boost)
+	if (ours && !(p->flags & PF_EXITING) &&
+	    age < msecs_to_jiffies(READ_ONCE(max_ms))) {
+		if (age < msecs_to_jiffies(READ_ONCE(min_ms)) ||
+		    READ_ONCE(p->se.avg.util_avg) >= READ_ONCE(settle_util))
+			lb->quiet = 0;
+		else
+			lb->quiet++;
+
+		if (lb->quiet < 2) {
+			queue_delayed_work(system_unbound_wq, &lb->work,
+					   msecs_to_jiffies(POLL_MS));
+			return;
+		}
+	}
+
+	if (ours && !(p->flags & PF_EXITING))
 		set_clamp(p, lb->orig_min, lb->orig_reset_on_fork);
 
 	put_task_struct(p);
@@ -124,7 +157,8 @@ void launch_boost_setuid(uid_t old_uid, uid_t new_uid)
 
 	get_task_struct(p);
 	lb->p = p;
-	INIT_DELAYED_WORK(&lb->work, launch_boost_end);
-	queue_delayed_work(system_unbound_wq, &lb->work,
-			   msecs_to_jiffies(READ_ONCE(duration_ms)));
+	lb->start = jiffies;
+	lb->quiet = 0;
+	INIT_DELAYED_WORK(&lb->work, launch_boost_poll);
+	queue_delayed_work(system_unbound_wq, &lb->work, msecs_to_jiffies(POLL_MS));
 }
