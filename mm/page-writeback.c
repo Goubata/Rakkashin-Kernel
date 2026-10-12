@@ -101,7 +101,8 @@ static unsigned long vm_dirty_bytes;
 /*
  * The interval between `kupdate'-style writebacks
  */
-unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
+/* avr: 15s instead of 5s, fewer flash wakeups; expiry (30s) is unchanged */
+unsigned int dirty_writeback_interval = 15 * 100; /* centiseconds */
 
 EXPORT_SYMBOL_GPL(dirty_writeback_interval);
 

@@ -1116,6 +1116,22 @@ config EXT_GROUP_SCHED
 
 endif #CGROUP_SCHED
 
+config LAUNCH_BOOST
+	bool "Boost apps while zygote launches them"
+	depends on UCLAMP_TASK
+	help
+	  Give a freshly specialized app process (setresuid from root to an
+	  app UID) a temporary uclamp.min floor so cold starts run fast.
+	  Tunables in /sys/module/launch_boost/parameters/.
+
+config AVR_PROFILE
+	bool "avr performance profiles"
+	depends on CPU_FREQ && SYSCTL
+	help
+	  /sys/kernel/avr_profile/mode switches cpufreq floors/caps (via
+	  frequency QoS), PELT half-life, launch boost and writeback interval
+	  together: battery, balanced, performance, game.
+
 config SCHED_MM_CID
 	def_bool y
 	depends on SMP && RSEQ
