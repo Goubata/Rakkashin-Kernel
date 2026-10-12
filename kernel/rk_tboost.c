@@ -6,7 +6,8 @@
  * jumps, the frame that jumps runs at the old, too-low frequency. While the
  * profile asks for it (performance, game), every period this finds the
  * heaviest threads of the foreground app (top-app cpuset) by their PELT
- * utilization and gives each a uclamp.min of util + headroom, so frequency
+ * utilization (or util_est, if higher) and gives each a uclamp.min of
+ * util + headroom, so frequency
  * and core placement already have spare capacity when the spike lands.
  *
  * Boosted threads get SCHED_FLAG_RESET_ON_FORK so threads they spawn don't
@@ -94,6 +95,19 @@ static void release_all(void)
 			release(&slots[i]);
 }
 
+/*
+ * Load of a thread: the larger of PELT's running average and its util_est
+ * (the peak of recent activations), so a thread that just went idle between
+ * frames still counts with the load it will bring back next frame.
+ */
+static unsigned long thread_util(struct task_struct *t)
+{
+	unsigned long avg = READ_ONCE(t->se.avg.util_avg);
+	unsigned long est = READ_ONCE(t->se.avg.util_est) & ~UTIL_AVG_UNCHANGED;
+
+	return max(avg, est);
+}
+
 static unsigned int target_of(unsigned long util, unsigned int headroom)
 {
 	unsigned long t = util + util * headroom / 100;
@@ -128,7 +142,7 @@ static void tboost_fn(struct work_struct *work)
 	/* pick the n heaviest foreground threads */
 	css_task_iter_start(top_app, 0, &it);
 	while ((t = css_task_iter_next(&it))) {
-		unsigned long u = READ_ONCE(t->se.avg.util_avg);
+		unsigned long u = thread_util(t);
 
 		if (u < READ_ONCE(min_util) || (t->flags & (PF_EXITING | PF_KTHREAD)))
 			continue;
