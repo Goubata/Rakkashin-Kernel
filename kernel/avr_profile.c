@@ -8,7 +8,7 @@
  *   cat /sys/kernel/avr_profile/mode        # "battery [balanced] performance game"
  *
  *   mode         cpufreq floor/cap  PELT   launch boost  writeback  thread boost
- *   battery      cap 70% of max     32 ms  off           30 s       off
+ *   battery      efficiency cap     32 ms  off           30 s       off
  *   balanced     -                  16 ms  on            15 s       off
  *   performance  floor 30% of max   8 ms   on            15 s       +15%
  *   game         floor 50% of max   8 ms   on            15 s       +25%
@@ -23,6 +23,13 @@
  *   echo "10234:game 10077:battery" > /sys/kernel/avr_profile/app_profiles
  *   echo 0 > /sys/kernel/avr_profile/per_app    # ignore app_profiles
  *
+ * Battery caps each cluster at its efficiency knee, read from the Energy
+ * Model: the highest frequency whose cost (energy per unit of work) is
+ * within 25% of the cluster's most efficient state, kept within 50..85% of
+ * max. Without a real (non-artificial) EM it falls back to 70%. The caps in
+ * use are shown in battery_caps. (Voltage itself is set by firmware/CPR on
+ * this SoC and is not reachable from the kernel.)
+ *
  * CPU frequency is steered only through cpufreq's frequency QoS, the same
  * mechanism thermal mitigation uses. QoS takes the lowest max request and
  * the highest min request, and the policy max always wins over min, so a
@@ -33,6 +40,7 @@
 #include <linux/cgroup.h>
 #include <linux/cpufreq.h>
 #include <linux/cred.h>
+#include <linux/energy_model.h>
 #include <linux/kobject.h>
 #include <linux/launch_boost.h>
 #include <linux/mutex.h>
@@ -45,7 +53,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.3 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.4 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 
@@ -61,6 +69,7 @@ struct avr_mode_params {
 	const char *name;
 	unsigned int min_pct;		/* cpufreq floor, % of cpuinfo max; 0 = none */
 	unsigned int max_pct;		/* cpufreq cap, % of cpuinfo max; 100 = none */
+	bool eff_cap;			/* use the EM efficiency knee instead of max_pct */
 	unsigned int pelt_mult;		/* 1: 32ms, 2: 16ms, 4: 8ms half-life */
 	bool launch_boost;
 	unsigned int writeback_cs;	/* dirty_writeback_interval, centiseconds */
@@ -75,10 +84,10 @@ static const char * const mode_names[AVR_NR_MODES] = {
 };
 
 static const struct avr_mode_params modes[AVR_NR_MODES] = {
-	[AVR_BATTERY]	  = { "battery",	 0,  70, 1, false, 3000,  0 },
-	[AVR_BALANCED]	  = { "balanced",	 0, 100, 2, true,  1500,  0 },
-	[AVR_PERFORMANCE] = { "performance",	30, 100, 4, true,  1500, 15 },
-	[AVR_GAME]	  = { "game",		50, 100, 4, true,  1500, 25 },
+	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1, false, 3000,  0 },
+	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, true,  1500,  0 },
+	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, true,  1500, 15 },
+	[AVR_GAME]	  = { "game",		50, 100, false, 4, true,  1500, 25 },
 };
 
 struct avr_policy_reqs {
@@ -109,6 +118,52 @@ static s32 pct_of(unsigned int max_freq, unsigned int pct)
 	return (s32)div_u64((u64)max_freq * pct, 100);
 }
 
+#define EFF_SLACK_PCT	25	/* accepted cost above the most efficient state */
+#define EFF_MIN_PCT	50	/* never cap below this share of max */
+#define EFF_MAX_PCT	85	/* ...nor above it */
+
+/*
+ * Highest frequency (kHz) whose cost is within EFF_SLACK_PCT of the cluster's
+ * most efficient state, or 0 if there is no usable Energy Model.
+ */
+static unsigned int efficiency_knee_khz(int cpu)
+{
+	struct em_perf_domain *pd = em_cpu_get(cpu);
+	struct em_perf_state *table;
+	unsigned long best = ULONG_MAX, knee = 0;
+	int i, n;
+
+	if (!pd || em_is_artificial(pd))
+		return 0;
+
+	rcu_read_lock();
+	table = em_perf_state_from_pd(pd);
+	n = em_pd_nr_perf_states(pd);
+	for (i = 0; i < n; i++)
+		if (table[i].cost && table[i].cost < best)
+			best = table[i].cost;
+	for (i = 0; i < n; i++)
+		if (table[i].cost &&
+		    table[i].cost * 100 <= best * (100 + EFF_SLACK_PCT))
+			knee = max(knee, table[i].frequency);
+	rcu_read_unlock();
+
+	return knee;
+}
+
+/* battery cap in kHz for this policy; *from_em tells whether the EM set it */
+static s32 battery_cap(struct cpufreq_policy *policy, unsigned int pct,
+		       bool *from_em)
+{
+	unsigned int fmax = policy->cpuinfo.max_freq;
+	unsigned int knee = efficiency_knee_khz(policy->cpu);
+
+	*from_em = knee;
+	if (!knee)
+		return pct_of(fmax, pct);
+	return clamp_t(s32, knee, pct_of(fmax, EFF_MIN_PCT), pct_of(fmax, EFF_MAX_PCT));
+}
+
 /* Called with avr_lock held. */
 static void apply_policy(struct cpufreq_policy *policy,
 			 const struct avr_mode_params *m)
@@ -117,6 +172,10 @@ static void apply_policy(struct cpufreq_policy *policy,
 	unsigned int fmax = policy->cpuinfo.max_freq;
 	s32 min = m->min_pct ? pct_of(fmax, m->min_pct) : FREQ_QOS_MIN_DEFAULT_VALUE;
 	s32 max = m->max_pct < 100 ? pct_of(fmax, m->max_pct) : FREQ_QOS_MAX_DEFAULT_VALUE;
+	bool from_em;
+
+	if (m->eff_cap)
+		max = battery_cap(policy, m->max_pct, &from_em);
 
 	if (!r->added) {
 		if (freq_qos_add_request(&policy->constraints, &r->min,
@@ -363,6 +422,33 @@ static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute status_attr = __ATTR_RO(status);
 
+/* per cluster: "cpuN: <cap kHz>/<max kHz> (energy-model|fallback)" */
+static ssize_t battery_caps_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	unsigned int cpu;
+	int len = 0;
+
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+		bool from_em;
+		s32 cap;
+
+		if (!policy)
+			continue;
+		if (policy->cpu == cpu) {
+			cap = battery_cap(policy, modes[AVR_BATTERY].max_pct, &from_em);
+			len += sysfs_emit_at(buf, len, "cpu%u: %d/%u kHz (%s)\n", cpu,
+					     cap, policy->cpuinfo.max_freq,
+					     from_em ? "energy-model" : "fallback");
+		}
+		cpufreq_cpu_put(policy);
+	}
+	return len;
+}
+
+static struct kobj_attribute battery_caps_attr = __ATTR_RO(battery_caps);
+
 static ssize_t app_profiles_show(struct kobject *kobj,
 				 struct kobj_attribute *attr, char *buf)
 {
@@ -452,6 +538,7 @@ static struct attribute *avr_profile_attrs[] = {
 	&per_app_attr.attr,
 	&app_profiles_attr.attr,
 	&status_attr.attr,
+	&battery_caps_attr.attr,
 	NULL
 };
 
