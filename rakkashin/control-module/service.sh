@@ -22,6 +22,10 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 # ADIOS I/O scheduler on UFS (default on; "0" in $STATE/adios disables it)
 [ "$(cat "$STATE/adios" 2>/dev/null)" != 0 ] && sh "$MODDIR/io.sh" apply
 
+# f2fs: let fsync of files with up to 20 dirty blocks take the fast
+# roll-forward path instead of a full checkpoint (stock: 8)
+for f in /sys/fs/f2fs/*/min_fsync_blocks; do [ -w "$f" ] && echo 20 > "$f"; done
+
 # Two-stage zram (default on; "0" in $STATE/zram2 disables it next boot)
 if [ "$(cat "$STATE/zram2" 2>/dev/null)" != 0 ]; then
 	sh "$MODDIR/zram.sh" setup && sh "$MODDIR/zram.sh" loop &

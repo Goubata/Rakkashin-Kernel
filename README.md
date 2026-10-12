@@ -40,11 +40,17 @@ by **Rakkashin**
 - Earlier kswapd (`watermark_scale_factor` 50), no watermark boost,
   no swap readahead on zram, `vfs_cache_pressure` 50
 
+**Storage / I/O**
+- ADIOS I/O scheduler on the UFS LUNs (by Masahito Suzuki)
+- LZ4 1.9.x fast decompression loop: faster reads from the EROFS system partitions
+- f2fs: fast-path fsync for files with up to 20 dirty blocks
+
 **Battery / latency**
 - Boeffla wakelock blocker (RCU rewrite), with a wakelock list in the WebUI
 - vmstat every 20 s, I/O stats and binder logging off, no fs sync on suspend,
   15 s writeback, power-efficient workqueues
-- TCP BBR, no slow start after idle, `tcp_notsent_lowat` 128K
+- TCP BBR with fq_codel as the default qdisc, no slow start after idle,
+  `tcp_notsent_lowat` 128K
 - Tuned for the Oryon cores (`-mtune=oryon-1`)
 
 **Compatibility**
@@ -52,7 +58,7 @@ by **Rakkashin**
   signing certificate is trusted, so stock vendor and system_dlkm modules load.
 - `uname -r` reports the stock release string.
 
-Ported ideas from AGNi, NGK, Melt and LawRun; original work for the profiles,
+Ported ideas from AGNi, NGK, Melt, LawRun and RealKing; original work for the profiles,
 per-app switching, thread boost, launch boost and efficiency caps.
 
 ## Install

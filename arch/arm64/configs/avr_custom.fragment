@@ -50,3 +50,6 @@ CONFIG_LAUNCH_BOOST=y
 CONFIG_AVR_PROFILE=y
 CONFIG_RK_TBOOST=y
 CONFIG_MQ_IOSCHED_ADIOS=y
+# fq_codel as the default qdisc (Realking): bounded queueing delay under load
+CONFIG_NET_SCH_DEFAULT=y
+CONFIG_DEFAULT_FQ_CODEL=y
