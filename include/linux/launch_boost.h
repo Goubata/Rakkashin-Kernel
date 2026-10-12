@@ -6,10 +6,10 @@
 
 #ifdef CONFIG_LAUNCH_BOOST
 void launch_boost_setuid(uid_t old_uid, uid_t new_uid);
-void launch_boost_set_enabled(bool on);
+void launch_boost_set(unsigned int uclamp);
 #else
 static inline void launch_boost_setuid(uid_t old_uid, uid_t new_uid) { }
-static inline void launch_boost_set_enabled(bool on) { }
+static inline void launch_boost_set(unsigned int uclamp) { }
 #endif
 
 #endif /* _LINUX_LAUNCH_BOOST_H */

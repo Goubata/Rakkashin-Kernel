@@ -7,11 +7,11 @@
  *   echo game > /sys/kernel/avr_profile/mode
  *   cat /sys/kernel/avr_profile/mode        # "battery [balanced] performance game"
  *
- *   mode         cpufreq floor/cap  PELT   launch boost  writeback  thread boost
- *   battery      efficiency cap     32 ms  off           30 s       off
- *   balanced     -                  16 ms  on            15 s       off
- *   performance  floor 30% of max   8 ms   on            15 s       +15%
- *   game         floor 50% of max   8 ms   on            15 s       +25%
+ *   mode         cpufreq floor/cap  PELT   launch boost  writeback  thread boost  slice
+ *   battery      efficiency cap     32 ms  uclamp 640    30 s       off           200%
+ *   balanced     -                  16 ms  uclamp 1024   15 s       off           100%
+ *   performance  floor 30% of max   8 ms   uclamp 1024   15 s       +15%          70%
+ *   game         floor 50% of max   8 ms   uclamp 1024   15 s       +25%          70%
  *
  * Per-app profiles: "mode" is the global profile. app_profiles maps app UIDs
  * to their own mode; when a task of such a UID is moved into the top-app
@@ -53,9 +53,11 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.5 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.6 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
+extern unsigned int sysctl_sched_base_slice;
+static unsigned int stock_slice;	/* captured before the first change */
 
 enum avr_mode {
 	AVR_BATTERY,
@@ -71,9 +73,10 @@ struct avr_mode_params {
 	unsigned int max_pct;		/* cpufreq cap, % of cpuinfo max; 100 = none */
 	bool eff_cap;			/* use the EM efficiency knee instead of max_pct */
 	unsigned int pelt_mult;		/* 1: 32ms, 2: 16ms, 4: 8ms half-life */
-	bool launch_boost;
+	unsigned int launch_uclamp;	/* launch boost floor, 0 = off */
 	unsigned int writeback_cs;	/* dirty_writeback_interval, centiseconds */
 	unsigned int tboost_pct;	/* foreground thread headroom boost, 0 = off */
+	unsigned int slice_pct;		/* EEVDF base slice, % of the stock value */
 };
 
 static const char * const mode_names[AVR_NR_MODES] = {
@@ -84,10 +87,10 @@ static const char * const mode_names[AVR_NR_MODES] = {
 };
 
 static const struct avr_mode_params modes[AVR_NR_MODES] = {
-	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1, false, 3000,  0 },
-	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, true,  1500,  0 },
-	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, true,  1500, 15 },
-	[AVR_GAME]	  = { "game",		50, 100, false, 4, true,  1500, 25 },
+	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1,  640, 3000,  0, 200 },
+	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, 1024, 1500,  0, 100 },
+	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, 1024, 1500, 15,  70 },
+	[AVR_GAME]	  = { "game",		50, 100, false, 4, 1024, 1500, 25,  70 },
 };
 
 struct avr_policy_reqs {
@@ -211,7 +214,16 @@ static void apply_mode(enum avr_mode mode)
 	}
 
 	sched_pelt_set_multiplier(m->pelt_mult);
-	launch_boost_set_enabled(m->launch_boost);
+	launch_boost_set(m->launch_uclamp);
+
+	/*
+	 * EEVDF base slice, relative to whatever the system set up (a vendor
+	 * scheduler may tune it): longer slices mean fewer context switches
+	 * and less cache churn, shorter ones mean quicker wakeup preemption.
+	 */
+	if (!stock_slice)
+		stock_slice = READ_ONCE(sysctl_sched_base_slice);
+	WRITE_ONCE(sysctl_sched_base_slice, stock_slice / 100 * m->slice_pct);
 	WRITE_ONCE(dirty_writeback_interval, m->writeback_cs);
 	rk_tboost_set_headroom(m->tboost_pct);
 

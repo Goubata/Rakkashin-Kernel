@@ -58,9 +58,12 @@ module_param(settle_util, uint, 0644);
 static unsigned int uclamp_min = SCHED_CAPACITY_SCALE;
 module_param(uclamp_min, uint, 0644);
 
-void launch_boost_set_enabled(bool on)
+/* for avr_profile: 0 disables, otherwise the uclamp.min floor to use */
+void launch_boost_set(unsigned int uclamp)
 {
-	WRITE_ONCE(enabled, on);
+	WRITE_ONCE(enabled, uclamp != 0);
+	if (uclamp)
+		WRITE_ONCE(uclamp_min, min_t(unsigned int, uclamp, SCHED_CAPACITY_SCALE));
 }
 
 struct launch_boost {
