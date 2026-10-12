@@ -24,6 +24,7 @@
 #include "cgroup-internal.h"
 #include "cpuset-internal.h"
 
+#include <linux/avr_profile.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -3064,6 +3065,7 @@ static void cpuset_attach_task(struct cpuset *cs, struct task_struct *task)
 	cpuset1_update_task_spread_flags(cs, task);
 
 	trace_android_vh_cpuset_attach_task(&cs->css, task);
+	avr_profile_cpuset_attach(&cs->css, task);
 }
 
 static void cpuset_attach(struct cgroup_taskset *tset)

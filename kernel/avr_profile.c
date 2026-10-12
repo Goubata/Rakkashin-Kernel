@@ -13,23 +13,38 @@
  *   performance  floor 30% of max      8 ms            on            15 s
  *   game         floor 50% of max      8 ms            on            15 s
  *
+ * Per-app profiles: "mode" is the global profile. app_profiles maps app UIDs
+ * to their own mode; when a task of such a UID is moved into the top-app
+ * cpuset (the framework does that when the app comes to the foreground) its
+ * mode takes effect, and once top-app no longer holds any of its tasks the
+ * global mode returns. No polling: decisions run off cpuset attach. Mode
+ * changes sysfs_notify() "mode" so userspace can follow with inotify.
+ *
+ *   echo "10234:game 10077:battery" > /sys/kernel/avr_profile/app_profiles
+ *   echo 0 > /sys/kernel/avr_profile/per_app    # ignore app_profiles
+ *
  * CPU frequency is steered only through cpufreq's frequency QoS, the same
  * mechanism thermal mitigation uses. QoS takes the lowest max request and
  * the highest min request, and the policy max always wins over min, so a
  * thermal cap is never overridden by a floor set here.
  */
 
+#include <linux/avr_profile.h>
+#include <linux/cgroup.h>
 #include <linux/cpufreq.h>
+#include <linux/cred.h>
 #include <linux/kobject.h>
 #include <linux/launch_boost.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
 #include <linux/sched/sysctl.h>
 #include <linux/string.h>
+#include <linux/slab.h>
 #include <linux/sysfs.h>
+#include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.0 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.1 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 
@@ -72,8 +87,20 @@ struct avr_policy_reqs {
 
 /* indexed by policy->cpu, the policy's owning CPU */
 static struct avr_policy_reqs reqs[NR_CPUS];
-static enum avr_mode cur_mode = AVR_BALANCED;
+static enum avr_mode cur_mode = AVR_BALANCED;	/* in effect */
+static enum avr_mode base_mode = AVR_BALANCED;	/* chosen by the user */
 static DEFINE_MUTEX(avr_lock);
+static struct kobject *avr_kobj;
+
+#define MAX_APP_PROFILES	64
+#define NO_UID			((uid_t)-1)
+/* each entry is (uid << 8 | mode), so lockless readers see whole entries */
+static u64 app_profiles[MAX_APP_PROFILES];
+static unsigned int nr_app_profiles;
+static bool per_app = true;
+static uid_t active_uid = NO_UID;		/* app whose profile is in effect */
+static uid_t pending_uid = NO_UID;		/* handed from cpuset attach to work */
+static struct cgroup_subsys_state *top_app_css;	/* cached, never released */
 
 static s32 pct_of(unsigned int max_freq, unsigned int pct)
 {
@@ -126,7 +153,11 @@ static void apply_mode(enum avr_mode mode)
 	launch_boost_set_enabled(m->launch_boost);
 	WRITE_ONCE(dirty_writeback_interval, m->writeback_cs);
 
-	cur_mode = mode;
+	if (cur_mode != mode) {
+		cur_mode = mode;
+		if (avr_kobj)
+			sysfs_notify(avr_kobj, NULL, "mode");
+	}
 }
 
 static int avr_policy_notifier(struct notifier_block *nb, unsigned long event,
@@ -154,6 +185,101 @@ static struct notifier_block avr_policy_nb = {
 	.notifier_call = avr_policy_notifier,
 };
 
+/* ---- per-app profiles ------------------------------------------------- */
+
+/* Returns the app's mode, or -1 if it has none. Lockless. */
+static int app_mode(uid_t uid)
+{
+	unsigned int i, n = READ_ONCE(nr_app_profiles);
+
+	for (i = 0; i < n; i++) {
+		u64 e = READ_ONCE(app_profiles[i]);
+
+		if ((uid_t)(e >> 8) == uid)
+			return e & 0xff;
+	}
+	return -1;
+}
+
+static void app_enter_fn(struct work_struct *work)
+{
+	uid_t uid = READ_ONCE(pending_uid);
+	int m;
+
+	mutex_lock(&avr_lock);
+	m = app_mode(uid);
+	if (per_app && m >= 0 && active_uid != uid) {
+		active_uid = uid;
+		apply_mode(m);
+	}
+	mutex_unlock(&avr_lock);
+}
+static DECLARE_WORK(app_enter_work, app_enter_fn);
+
+/* Fall back to the global mode once the active app has left top-app. */
+static void app_check_fn(struct work_struct *work)
+{
+	struct css_task_iter it;
+	struct task_struct *t;
+	uid_t uid = READ_ONCE(active_uid);
+	bool still = false;
+
+	if (uid == NO_UID || !top_app_css)
+		return;
+
+	css_task_iter_start(top_app_css, 0, &it);
+	while ((t = css_task_iter_next(&it))) {
+		if (from_kuid(&init_user_ns, task_uid(t)) == uid) {
+			still = true;
+			break;
+		}
+	}
+	css_task_iter_end(&it);
+
+	mutex_lock(&avr_lock);
+	if (!still && active_uid == uid) {
+		active_uid = NO_UID;
+		apply_mode(base_mode);
+	}
+	mutex_unlock(&avr_lock);
+}
+static DECLARE_DELAYED_WORK(app_check_work, app_check_fn);
+
+/*
+ * Called from cpuset_attach_task() with cpuset_mutex held: only look and
+ * queue work here, the mode switch itself takes cpufreq locks.
+ */
+void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
+			       struct task_struct *task)
+{
+	uid_t uid;
+
+	if (!READ_ONCE(per_app) || !READ_ONCE(nr_app_profiles))
+		return;
+
+	if (css != READ_ONCE(top_app_css)) {
+		if (top_app_css || strcmp(css->cgroup->kn->name, "top-app"))
+			return;
+		css_get(css);
+		WRITE_ONCE(top_app_css, css);
+	}
+
+	uid = from_kuid(&init_user_ns, task_uid(task));
+	if (uid % 100000 < 10000)	/* system UIDs never decide this */
+		return;
+
+	if (app_mode(uid) >= 0) {
+		if (uid != READ_ONCE(active_uid)) {
+			WRITE_ONCE(pending_uid, uid);
+			queue_work(system_unbound_wq, &app_enter_work);
+		}
+		cancel_delayed_work(&app_check_work);
+	} else if (READ_ONCE(active_uid) != NO_UID) {
+		/* let a transient (shade, dialog) settle before deciding */
+		mod_delayed_work(system_unbound_wq, &app_check_work, HZ);
+	}
+}
+
 static ssize_t mode_show(struct kobject *kobj, struct kobj_attribute *attr,
 			 char *buf)
 {
@@ -175,6 +301,9 @@ static ssize_t mode_store(struct kobject *kobj, struct kobj_attribute *attr,
 		return -EINVAL;
 
 	mutex_lock(&avr_lock);
+	base_mode = i;
+	/* an explicit choice wins until the next per-app switch */
+	active_uid = NO_UID;
 	apply_mode(i);
 	mutex_unlock(&avr_lock);
 
@@ -182,6 +311,126 @@ static ssize_t mode_store(struct kobject *kobj, struct kobj_attribute *attr,
 }
 
 static struct kobj_attribute mode_attr = __ATTR_RW(mode);
+
+static ssize_t per_app_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(per_app));
+}
+
+static ssize_t per_app_store(struct kobject *kobj, struct kobj_attribute *attr,
+			     const char *buf, size_t count)
+{
+	bool on;
+
+	if (kstrtobool(buf, &on))
+		return -EINVAL;
+
+	mutex_lock(&avr_lock);
+	WRITE_ONCE(per_app, on);
+	if (!on && active_uid != NO_UID) {
+		active_uid = NO_UID;
+		apply_mode(base_mode);
+	}
+	mutex_unlock(&avr_lock);
+	return count;
+}
+
+static struct kobj_attribute per_app_attr = __ATTR_RW(per_app);
+
+/* "global=<mode> active=<mode> app=<uid|->" for the control UI */
+static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
+			   char *buf)
+{
+	ssize_t len;
+
+	mutex_lock(&avr_lock);
+	if (active_uid == NO_UID)
+		len = sysfs_emit(buf, "global=%s active=%s app=-\n",
+				 mode_names[base_mode], mode_names[cur_mode]);
+	else
+		len = sysfs_emit(buf, "global=%s active=%s app=%u\n",
+				 mode_names[base_mode], mode_names[cur_mode],
+				 active_uid);
+	mutex_unlock(&avr_lock);
+	return len;
+}
+
+static struct kobj_attribute status_attr = __ATTR_RO(status);
+
+static ssize_t app_profiles_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	unsigned int i;
+	int len = 0;
+
+	mutex_lock(&avr_lock);
+	for (i = 0; i < nr_app_profiles; i++)
+		len += sysfs_emit_at(buf, len, "%u:%s ",
+				     (uid_t)(app_profiles[i] >> 8),
+				     mode_names[app_profiles[i] & 0xff]);
+	mutex_unlock(&avr_lock);
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+/* "uid:mode" tokens separated by spaces/commas/newlines; replaces the table */
+static ssize_t app_profiles_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	u64 new[MAX_APP_PROFILES];
+	unsigned int n = 0, i;
+	char *dup, *s, *tok;
+	int ret = count;
+
+	dup = kstrndup(buf, count, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	s = dup;
+	while ((tok = strsep(&s, " ,\n\t"))) {
+		char *colon = strchr(tok, ':');
+		int m;
+		u32 uid;
+
+		if (!*tok)
+			continue;
+		if (!colon || n == MAX_APP_PROFILES)
+			goto inval;
+		*colon = '\0';
+		m = match_string(mode_names, AVR_NR_MODES, colon + 1);
+		if (m < 0 || kstrtou32(tok, 10, &uid))
+			goto inval;
+		new[n++] = (u64)uid << 8 | m;
+	}
+
+	mutex_lock(&avr_lock);
+	/* shrink first so lockless readers never see half-updated slots */
+	WRITE_ONCE(nr_app_profiles, 0);
+	for (i = 0; i < n; i++)
+		WRITE_ONCE(app_profiles[i], new[i]);
+	WRITE_ONCE(nr_app_profiles, n);
+	/* the active app may have lost or changed its profile */
+	if (active_uid != NO_UID) {
+		int m = app_mode(active_uid);
+
+		if (m < 0) {
+			active_uid = NO_UID;
+			m = base_mode;
+		}
+		apply_mode(m);
+	}
+	mutex_unlock(&avr_lock);
+	goto out;
+inval:
+	ret = -EINVAL;
+out:
+	kfree(dup);
+	return ret;
+}
+
+static struct kobj_attribute app_profiles_attr = __ATTR_RW(app_profiles);
 
 /* lets the control UI tell it is running on this kernel, and which build */
 static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -195,6 +444,9 @@ static struct kobj_attribute version_attr = __ATTR_RO(version);
 static struct attribute *avr_profile_attrs[] = {
 	&mode_attr.attr,
 	&version_attr.attr,
+	&per_app_attr.attr,
+	&app_profiles_attr.attr,
+	&status_attr.attr,
 	NULL
 };
 
@@ -217,6 +469,7 @@ static int __init avr_profile_init(void)
 		return ret;
 	}
 
+	avr_kobj = kobj;
 	pr_info("%s\n", RAKKASHIN_VERSION);
 	return cpufreq_register_notifier(&avr_policy_nb, CPUFREQ_POLICY_NOTIFIER);
 }
