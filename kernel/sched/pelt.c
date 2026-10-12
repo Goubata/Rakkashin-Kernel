@@ -514,11 +514,12 @@ bool update_other_load_avgs(struct rq *rq)
 		update_irq_load_avg(rq, 0);
 }
 
-__read_mostly unsigned int sched_pelt_lshift;
+/* 16ms PELT half-life by default (LawRun); tunable via kernel.sched_pelt_multiplier */
+__read_mostly unsigned int sched_pelt_lshift = 1;
 
 #ifdef CONFIG_SYSCTL
 #include <trace/hooks/sched.h>
-static unsigned int sysctl_sched_pelt_multiplier = 1;
+static unsigned int sysctl_sched_pelt_multiplier = 2;
 
 int sched_pelt_multiplier(const struct ctl_table *table, int write, void *buffer,
 			  size_t *lenp, loff_t *ppos)
@@ -558,6 +559,16 @@ done:
 	mutex_unlock(&mutex);
 
 	return ret;
+}
+
+/* For in-kernel policy (avr_profile): multiplier 1, 2 or 4. */
+int sched_pelt_set_multiplier(unsigned int mult)
+{
+	if (mult != 1 && mult != 2 && mult != 4)
+		return -EINVAL;
+	WRITE_ONCE(sysctl_sched_pelt_multiplier, mult);
+	WRITE_ONCE(sched_pelt_lshift, mult >> 1);
+	return 0;
 }
 
 static struct ctl_table sched_pelt_sysctls[] = {
