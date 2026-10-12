@@ -1,6 +1,6 @@
 id=rakkashin
 name=Rakkashin Kernel Control
-version=v1.5
-versionCode=6
+version=v1.6
+versionCode=7
 author=Rakkashin
 description=Control panel for Rakkashin Kernel: global and per-app profiles, thread boost, adaptive launch boost, keep-more-apps, two-stage zram, wakelock blocker, fsync. Requires Rakkashin Kernel.

@@ -15,23 +15,27 @@ by **Rakkashin**
 
 **Profiles** — `/sys/kernel/avr_profile/mode`, switched from the WebUI
 
-| | CPU frequency | PELT | Launch boost | Thread boost | Writeback | Background apps |
-|---|---|---|---|---|---|---|
-| battery | capped at the Energy Model efficiency knee | 32 ms | off | off | 30 s | heavily limited |
-| balanced | stock | 16 ms | on | off | 15 s | stock |
-| performance | floor 30% | 8 ms | on | +15% | 15 s | stock |
-| game | floor 50% | 8 ms | on | +25% | 15 s | limited |
+| | CPU frequency | PELT | Launch boost | Thread boost | Sched slice | Writeback | Background apps |
+|---|---|---|---|---|---|---|---|
+| battery | capped at the Energy Model efficiency knee | 32 ms | gentle (62%) | off | 2× | 30 s | heavily limited |
+| balanced | stock | 16 ms | full | off | stock | 15 s | capped at 50% |
+| performance | floor 30% | 8 ms | full | +15% | 0.7× | 15 s | stock |
+| game | floor 50% | 8 ms | full | +25% | 0.7× | 15 s | limited |
 
 - **Per-app profiles**: give any app its own profile; it applies while that app
   is in the foreground (decided in-kernel on cpuset attach, no polling).
 - **Thread boost**: the heaviest foreground threads get a uclamp floor of
   their load plus headroom, so frequency is already up when frame work spikes.
-- **App launch boost**: a freshly started app runs flat out for 1 s.
+- **App launch boost**: a freshly started app runs flat out until its launch
+  work settles (0.3–2 s, adaptive).
+- **Sched slice**: EEVDF base slice relative to stock; longer in battery
+  (fewer context switches), shorter in performance/game (snappier).
 - **Battery caps** come from the Energy Model: the highest frequency whose
   energy cost is within 25% of the most efficient state (50–85% of max).
 - CPU limits use cpufreq frequency QoS, so thermal limits always win.
 
 **Memory**
+- Keep more apps in RAM: lmkd tuned for 16GB, up to 64 cached apps
 - Two-stage zram: lzo-rle for speed, idle pages re-packed with zstd every 30 min
 - Earlier kswapd (`watermark_scale_factor` 50), no watermark boost,
   no swap readahead on zram, `vfs_cache_pressure` 50

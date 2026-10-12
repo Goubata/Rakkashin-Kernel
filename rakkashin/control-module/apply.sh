@@ -38,6 +38,12 @@ fi
 while read -r g k v; do setu "$g" "$k" "$v"; done < "$STATE/cg_defaults"
 
 case "$MODE" in
+balanced)
+	# background work runs on lower, more efficient frequencies; the
+	# foreground app is untouched
+	setu background max 50
+	setu system-background max 60
+	;;
 battery)
 	setu background max 20
 	setu system-background max 30
