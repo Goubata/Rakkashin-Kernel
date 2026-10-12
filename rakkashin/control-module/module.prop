@@ -1,6 +1,6 @@
 id=rakkashin
 name=Rakkashin Kernel Control
-version=v1.8
-versionCode=9
+version=v1.9
+versionCode=10
 author=Rakkashin
 description=Control panel for Rakkashin Kernel: global and per-app profiles, power meter, thread and launch boost, ADIOS I/O, keep-more-apps, two-stage zram, wakelock blocker, fsync. Requires Rakkashin Kernel.

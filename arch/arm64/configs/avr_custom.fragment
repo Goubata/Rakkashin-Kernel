@@ -53,3 +53,13 @@ CONFIG_MQ_IOSCHED_ADIOS=y
 # fq_codel as the default qdisc (Realking): bounded queueing delay under load
 CONFIG_NET_SCH_DEFAULT=y
 CONFIG_DEFAULT_FQ_CODEL=y
+
+# --- zram ---
+# Stock zram.ko (system_dlkm) only has lzo/lzo-rle and zstd. Build zram in,
+# with LZ4 (much faster decompression on arm64, helped by the LZ4 fast
+# decode loop) as the default; the stock module then fails to load as a
+# duplicate. Everything else matches the stock zram config.
+CONFIG_ZSMALLOC=y
+CONFIG_ZRAM=y
+CONFIG_ZRAM_BACKEND_LZ4=y
+CONFIG_ZRAM_DEF_COMP_LZ4=y
