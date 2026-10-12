@@ -168,3 +168,8 @@ static inline void device_pm_init(struct device *dev)
 	device_pm_sleep_init(dev);
 	pm_runtime_init(dev);
 }
+
+#ifdef CONFIG_BOEFFLA_WL_BLOCKER
+struct wakeup_source;
+extern bool boeffla_wl_blocked(struct wakeup_source *ws);
+#endif

@@ -588,6 +588,11 @@ static void wakeup_source_activate(struct wakeup_source *ws)
  */
 static void wakeup_source_report_event(struct wakeup_source *ws, bool hard)
 {
+#ifdef CONFIG_BOEFFLA_WL_BLOCKER
+	/* Blocked wakelocks never activate, so they cannot hold off suspend. */
+	if (boeffla_wl_blocked(ws))
+		goto out;
+#endif
 	ws->event_count++;
 	/* This is racy, but the counter is approximate anyway. */
 	if (events_check_enabled)
@@ -596,6 +601,9 @@ static void wakeup_source_report_event(struct wakeup_source *ws, bool hard)
 	if (!ws->active)
 		wakeup_source_activate(ws);
 
+#ifdef CONFIG_BOEFFLA_WL_BLOCKER
+out:
+#endif
 	if (hard)
 		pm_system_wakeup();
 }
@@ -886,7 +894,10 @@ void pm_print_active_wakeup_sources(void)
 	list_for_each_entry_rcu_locked(ws, &wakeup_sources, entry) {
 		if (ws->active) {
 			pm_pr_dbg("active wakeup source: %s\n", ws->name);
-			active = 1;
+#ifdef CONFIG_BOEFFLA_WL_BLOCKER
+			if (!boeffla_wl_blocked(ws))
+#endif
+				active = 1;
 		} else if (!active &&
 			   (!last_activity_ws ||
 			    ktime_to_ns(ws->last_time) >
