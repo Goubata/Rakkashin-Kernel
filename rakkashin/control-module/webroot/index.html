@@ -47,6 +47,13 @@
 </header>
 
 <div class="card">
+  <div class="row" style="padding:0">
+    <div><b data-i18n="pw_title"></b><div class="sub" data-i18n="pw_desc"></div></div>
+    <div style="text-align:right"><b id="pw_now" style="font-size:20px">-</b><div class="sub" id="pw_avg"></div></div>
+  </div>
+</div>
+
+<div class="card">
   <h2 data-i18n="profile"></h2>
   <p class="sub" id="now"></p>
   <div class="modes" id="modes"></div>
@@ -72,6 +79,10 @@
   <div class="row">
     <div><b data-i18n="tb_title"></b><div class="sub" data-i18n="tb_desc"></div></div>
     <input type="checkbox" id="tb">
+  </div>
+  <div class="row">
+    <div><b data-i18n="io_title"></b><div class="sub" data-i18n="io_desc"></div></div>
+    <input type="checkbox" id="adios">
   </div>
   <div class="row">
     <div><b data-i18n="lmk_title"></b><div class="sub" data-i18n="lmk_desc"></div></div>
@@ -114,6 +125,14 @@ const T = {
     balanced: ["バランス", "標準・裏アプリは省電力に（初期値）"],
     performance: ["パフォーマンス", "周波数下限30%・反応速め・スレッドブースト+15%"],
     game: ["ゲーム", "下限50%・前面アプリ優先・スレッドブースト+25%"],
+    pw_title: "消費電力",
+    pw_desc: "電池から出ている電力です。プロファイルを切り替えて見比べられます。",
+    pw_avg: (w) => `直近60秒の平均 ${w} W`,
+    pw_charging: "充電中",
+    io_title: "ADIOS I/O スケジューラ",
+    io_desc: "ストレージの読み書きの順番を賢く決めて、アプリの起動や読み込みの待ち時間を短くします。",
+    io_on: "ADIOS に切り替えました",
+    io_off: "元のスケジューラに戻しました",
     lmk_title: "アプリを RAM に多く残す",
     lmk_desc: "16GB 向けにアプリの自動終了を控えめにし、裏に残すアプリを最大64個にします。アプリに戻ったときの再起動が減ります。",
     lmk_on: "オンにしました",
@@ -149,6 +168,14 @@ const T = {
     balanced: ["Balanced", "Default, background apps run efficiently"],
     performance: ["Performance", "30% frequency floor, faster response, thread boost +15%"],
     game: ["Game", "50% floor, foreground first, thread boost +25%"],
+    pw_title: "Power draw",
+    pw_desc: "Power drawn from the battery. Switch profiles to compare.",
+    pw_avg: (w) => `60 s average ${w} W`,
+    pw_charging: "Charging",
+    io_title: "ADIOS I/O scheduler",
+    io_desc: "Orders storage reads and writes smartly to cut wait times when apps start or load.",
+    io_on: "Switched to ADIOS",
+    io_off: "Restored the original scheduler",
     lmk_title: "Keep more apps in RAM",
     lmk_desc: "Kills background apps less eagerly (tuned for 16GB) and keeps up to 64 cached apps, so switching back doesn't restart them.",
     lmk_on: "Enabled",
@@ -335,6 +362,13 @@ async function init() {
   bindToggle("fsync", FSYNC, "fsync");
   bindToggle("lb", LB, "launch_boost");
   bindToggle("tb", TB, "tboost");
+  const io = document.getElementById("adios");
+  io.checked = (await exec(`cat ${STATE}/adios 2>/dev/null`)).stdout.trim() !== "0";
+  io.onchange = async () => {
+    const on = io.checked;
+    await exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/adios && sh ${MODDIR}/io.sh ${on ? "apply" : "revert"}`);
+    status(on ? T.io_on : T.io_off);
+  };
   const lmk = document.getElementById("lmk");
   lmk.checked = (await exec(`cat ${STATE}/lmk 2>/dev/null`)).stdout.trim() !== "0";
   lmk.onchange = async () => {
@@ -362,6 +396,26 @@ async function init() {
   document.getElementById("wlreload").onclick = loadWakelocks;
   loadWakelocks();
 }
+// ---- power meter (runs only while the WebUI is visible) ----
+const BAT = "/sys/class/power_supply/battery";
+const samples = [];
+async function samplePower() {
+  if (document.hidden) return;
+  const r = await exec(`cat ${BAT}/current_now ${BAT}/voltage_now ${BAT}/status`);
+  const [i, v, st] = r.stdout.trim().split("\n");
+  if (!i || !v) return;
+  const w = Math.abs(Number(i) * Number(v)) / 1e12;	// uA * uV -> W
+  const now = document.getElementById("pw_now");
+  if (st === "Charging") { now.textContent = T.pw_charging; samples.length = 0; return; }
+  now.textContent = w.toFixed(2) + " W";
+  samples.push(w);
+  if (samples.length > 60) samples.shift();
+  const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+  document.getElementById("pw_avg").textContent = T.pw_avg(avg.toFixed(2));
+}
+setInterval(samplePower, 1000);
+samplePower();
+
 init();
 </script>
 </body>

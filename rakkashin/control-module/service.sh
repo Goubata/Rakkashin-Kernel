@@ -19,6 +19,9 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 # Keep more apps cached (default on; "0" in $STATE/lmk disables it)
 [ "$(cat "$STATE/lmk" 2>/dev/null)" != 0 ] && sh "$MODDIR/lmk.sh" apply
 
+# ADIOS I/O scheduler on UFS (default on; "0" in $STATE/adios disables it)
+[ "$(cat "$STATE/adios" 2>/dev/null)" != 0 ] && sh "$MODDIR/io.sh" apply
+
 # Two-stage zram (default on; "0" in $STATE/zram2 disables it next boot)
 if [ "$(cat "$STATE/zram2" 2>/dev/null)" != 0 ]; then
 	sh "$MODDIR/zram.sh" setup && sh "$MODDIR/zram.sh" loop &
