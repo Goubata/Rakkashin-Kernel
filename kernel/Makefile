@@ -57,6 +57,7 @@ obj-y += dma/
 obj-y += entry/
 obj-$(CONFIG_LAUNCH_BOOST) += launch_boost.o
 obj-$(CONFIG_AVR_PROFILE) += avr_profile.o
+obj-$(CONFIG_RK_TBOOST) += rk_tboost.o
 obj-$(CONFIG_MODULES) += module/
 
 obj-$(CONFIG_KCMP) += kcmp.o

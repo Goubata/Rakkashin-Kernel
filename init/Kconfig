@@ -1132,6 +1132,14 @@ config AVR_PROFILE
 	  frequency QoS), PELT half-life, launch boost and writeback interval
 	  together: battery, balanced, performance, game.
 
+config RK_TBOOST
+	bool "Rakkashin foreground thread headroom boost"
+	depends on AVR_PROFILE && UCLAMP_TASK
+	help
+	  In the performance and game profiles, periodically give the heaviest
+	  foreground threads a uclamp.min of their utilization plus headroom,
+	  so frequency is already up when frame work spikes.
+
 config SCHED_MM_CID
 	def_bool y
 	depends on SMP && RSEQ

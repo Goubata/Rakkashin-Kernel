@@ -7,11 +7,11 @@
  *   echo game > /sys/kernel/avr_profile/mode
  *   cat /sys/kernel/avr_profile/mode        # "battery [balanced] performance game"
  *
- *   mode         cpufreq floor/cap     PELT half-life  launch boost  writeback
- *   battery      cap 70% of max        32 ms           off           30 s
- *   balanced     -                     16 ms           on            15 s
- *   performance  floor 30% of max      8 ms            on            15 s
- *   game         floor 50% of max      8 ms            on            15 s
+ *   mode         cpufreq floor/cap  PELT   launch boost  writeback  thread boost
+ *   battery      cap 70% of max     32 ms  off           30 s       off
+ *   balanced     -                  16 ms  on            15 s       off
+ *   performance  floor 30% of max   8 ms   on            15 s       +15%
+ *   game         floor 50% of max   8 ms   on            15 s       +25%
  *
  * Per-app profiles: "mode" is the global profile. app_profiles maps app UIDs
  * to their own mode; when a task of such a UID is moved into the top-app
@@ -37,6 +37,7 @@
 #include <linux/launch_boost.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
+#include <linux/rk_tboost.h>
 #include <linux/sched/sysctl.h>
 #include <linux/string.h>
 #include <linux/slab.h>
@@ -44,7 +45,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.1 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.2 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 
@@ -63,6 +64,7 @@ struct avr_mode_params {
 	unsigned int pelt_mult;		/* 1: 32ms, 2: 16ms, 4: 8ms half-life */
 	bool launch_boost;
 	unsigned int writeback_cs;	/* dirty_writeback_interval, centiseconds */
+	unsigned int tboost_pct;	/* foreground thread headroom boost, 0 = off */
 };
 
 static const char * const mode_names[AVR_NR_MODES] = {
@@ -73,10 +75,10 @@ static const char * const mode_names[AVR_NR_MODES] = {
 };
 
 static const struct avr_mode_params modes[AVR_NR_MODES] = {
-	[AVR_BATTERY]	  = { "battery",	 0,  70, 1, false, 3000 },
-	[AVR_BALANCED]	  = { "balanced",	 0, 100, 2, true,  1500 },
-	[AVR_PERFORMANCE] = { "performance",	30, 100, 4, true,  1500 },
-	[AVR_GAME]	  = { "game",		50, 100, 4, true,  1500 },
+	[AVR_BATTERY]	  = { "battery",	 0,  70, 1, false, 3000,  0 },
+	[AVR_BALANCED]	  = { "balanced",	 0, 100, 2, true,  1500,  0 },
+	[AVR_PERFORMANCE] = { "performance",	30, 100, 4, true,  1500, 15 },
+	[AVR_GAME]	  = { "game",		50, 100, 4, true,  1500, 25 },
 };
 
 struct avr_policy_reqs {
@@ -152,6 +154,7 @@ static void apply_mode(enum avr_mode mode)
 	sched_pelt_set_multiplier(m->pelt_mult);
 	launch_boost_set_enabled(m->launch_boost);
 	WRITE_ONCE(dirty_writeback_interval, m->writeback_cs);
+	rk_tboost_set_headroom(m->tboost_pct);
 
 	if (cur_mode != mode) {
 		cur_mode = mode;
@@ -254,15 +257,17 @@ void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 {
 	uid_t uid;
 
-	if (!READ_ONCE(per_app) || !READ_ONCE(nr_app_profiles))
-		return;
-
 	if (css != READ_ONCE(top_app_css)) {
 		if (top_app_css || strcmp(css->cgroup->kn->name, "top-app"))
 			return;
+		/* first sight of top-app: cache it for good (thread boost too) */
 		css_get(css);
 		WRITE_ONCE(top_app_css, css);
+		rk_tboost_set_top_app(css);
 	}
+
+	if (!READ_ONCE(per_app) || !READ_ONCE(nr_app_profiles))
+		return;
 
 	uid = from_kuid(&init_user_ns, task_uid(task));
 	if (uid % 100000 < 10000)	/* system UIDs never decide this */
