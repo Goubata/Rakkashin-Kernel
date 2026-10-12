@@ -48,6 +48,10 @@ KBUILD_CFLAGS	+= $(CC_FLAGS_NO_FPU) \
 KBUILD_CFLAGS	+= $(call cc-disable-warning, psabi)
 KBUILD_AFLAGS	+= $(compat_vdso)
 
+# Schedule for avr's Qualcomm Oryon cores (idea from Melt's per-SoC -mcpu).
+# -mtune only: the instruction set stays generic armv8, so no KMI/ISA change.
+KBUILD_CFLAGS	+= $(call cc-option,-mtune=oryon-1)
+
 ifeq ($(call rustc-min-version, 108500),y)
 KBUILD_RUSTFLAGS += --target=aarch64-unknown-none-softfloat
 else
