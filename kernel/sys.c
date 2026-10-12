@@ -72,6 +72,7 @@
 #include <generated/utsrelease.h>
 
 #include <linux/uaccess.h>
+#include <linux/launch_boost.h>
 #include <asm/io.h>
 #include <asm/unistd.h>
 
@@ -694,6 +695,7 @@ long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 	int retval;
 	kuid_t kruid, keuid, ksuid;
 	bool ruid_new, euid_new, suid_new;
+	uid_t old_uid, new_uid;
 
 #ifdef CONFIG_KSU_SUSFS
 	(void)ksu_handle_setresuid(ruid, euid, suid);
@@ -760,7 +762,13 @@ long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)
 	trace_android_vh_security_audit_log_setid(2, old->uid.val, new->uid.val);
 
 	flag_nproc_exceeded(new);
-	return commit_creds(new);
+	/* old is no longer valid once commit_creds() returns */
+	old_uid = old->uid.val;
+	new_uid = new->uid.val;
+	retval = commit_creds(new);
+	if (!retval)
+		launch_boost_setuid(old_uid, new_uid);
+	return retval;
 
 error:
 	abort_creds(new);
