@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * avr performance profiles.
+ * Rakkashin kernel: avr performance profiles.
  *
  * One switch that moves several kernel knobs together:
  *
@@ -28,6 +28,8 @@
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/writeback.h>
+
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.0 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 
@@ -181,8 +183,18 @@ static ssize_t mode_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute mode_attr = __ATTR_RW(mode);
 
+/* lets the control UI tell it is running on this kernel, and which build */
+static ssize_t version_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sysfs_emit(buf, "%s\n", RAKKASHIN_VERSION);
+}
+
+static struct kobj_attribute version_attr = __ATTR_RO(version);
+
 static struct attribute *avr_profile_attrs[] = {
 	&mode_attr.attr,
+	&version_attr.attr,
 	NULL
 };
 
@@ -205,6 +217,7 @@ static int __init avr_profile_init(void)
 		return ret;
 	}
 
+	pr_info("%s\n", RAKKASHIN_VERSION);
 	return cpufreq_register_notifier(&avr_policy_nb, CPUFREQ_POLICY_NOTIFIER);
 }
 late_initcall(avr_profile_init);
