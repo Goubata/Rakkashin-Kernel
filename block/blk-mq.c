@@ -4363,7 +4363,11 @@ struct request_queue *blk_mq_alloc_queue(struct blk_mq_tag_set *set,
 
 	if (!lim)
 		lim = &default_lim;
-	lim->features |= BLK_FEAT_IO_STAT | BLK_FEAT_NOWAIT;
+	/*
+	 * I/O accounting off by default (NGK): saves per-request bookkeeping.
+	 * Re-enable per queue via /sys/block/<dev>/queue/iostats.
+	 */
+	lim->features |= BLK_FEAT_NOWAIT;
 	if (set->nr_maps > HCTX_TYPE_POLL)
 		lim->features |= BLK_FEAT_POLL;
 
