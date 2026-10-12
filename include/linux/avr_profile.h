@@ -8,9 +8,11 @@ struct task_struct;
 #ifdef CONFIG_AVR_PROFILE
 void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 			       struct task_struct *task);
+void avr_profile_kick(void);
 #else
 static inline void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 					     struct task_struct *task) { }
+static inline void avr_profile_kick(void) { }
 #endif
 
 #endif /* _LINUX_AVR_PROFILE_H */

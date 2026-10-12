@@ -23,6 +23,10 @@ CACHED=64
 log() { echo "rakkashin-lmk: $*" > /dev/kmsg; }
 
 apply() {
+	if [ ! -x "$RP" ] && ! command -v resetprop >/dev/null; then
+		log "resetprop not found, lmkd left unchanged"
+		return 1
+	fi
 	mkdir -p "$STATE"
 	if [ ! -s "$SAVED" ]; then
 		echo "$PROPS" | while read -r p _; do

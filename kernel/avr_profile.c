@@ -9,7 +9,7 @@
  *
  *   mode         cpufreq floor/cap  PELT   launch boost  writeback  thread boost  slice
  *   battery      efficiency cap     32 ms  uclamp 640    30 s       off           200%
- *   balanced     -                  16 ms  uclamp 1024   15 s       off           100%
+ *   balanced     smart cap (below)  16 ms  uclamp 1024   15 s       off           100%
  *   performance  floor 30% of max   8 ms   uclamp 1024   15 s       +15%          70%
  *   game         floor 50% of max   8 ms   uclamp 1024   15 s       +25%          70%
  *
@@ -30,6 +30,14 @@
  * use are shown in battery_caps. (Voltage itself is set by firmware/CPR on
  * this SoC and is not reachable from the kernel.)
  *
+ * Smart Balanced: in balanced, CPUs are capped at smart_cap percent of max
+ * (default 80) while nobody touches the screen, and the cap is lifted the
+ * moment a touch event arrives (in-kernel input handler) or an app launches,
+ * held for SMART_HOLD_MS after the last touch. The top of the frequency
+ * range is where energy per unit of work is worst; this trims it during
+ * passive use (reading, video, background work) without touching interactive
+ * performance. smart_cap=100 restores plain balanced.
+ *
  * CPU frequency is steered only through cpufreq's frequency QoS, the same
  * mechanism thermal mitigation uses. QoS takes the lowest max request and
  * the highest min request, and the policy max always wins over min, so a
@@ -41,6 +49,7 @@
 #include <linux/cpufreq.h>
 #include <linux/cred.h>
 #include <linux/energy_model.h>
+#include <linux/input.h>
 #include <linux/kobject.h>
 #include <linux/launch_boost.h>
 #include <linux/mutex.h>
@@ -53,7 +62,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v1.9 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.0 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned int sysctl_sched_base_slice;
@@ -77,6 +86,7 @@ struct avr_mode_params {
 	unsigned int writeback_cs;	/* dirty_writeback_interval, centiseconds */
 	unsigned int tboost_pct;	/* foreground thread headroom boost, 0 = off */
 	unsigned int slice_pct;		/* EEVDF base slice, % of the stock value */
+	bool smart;			/* touch-aware smart_cap applies */
 };
 
 static const char * const mode_names[AVR_NR_MODES] = {
@@ -87,10 +97,10 @@ static const char * const mode_names[AVR_NR_MODES] = {
 };
 
 static const struct avr_mode_params modes[AVR_NR_MODES] = {
-	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1,  640, 3000,  0, 200 },
-	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, 1024, 1500,  0, 100 },
-	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, 1024, 1500, 15,  70 },
-	[AVR_GAME]	  = { "game",		50, 100, false, 4, 1024, 1500, 25,  70 },
+	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1,  640, 3000,  0, 200, false },
+	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, 1024, 1500,  0, 100, true  },
+	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, 1024, 1500, 15,  70, false },
+	[AVR_GAME]	  = { "game",		50, 100, false, 4, 1024, 1500, 25,  70, false },
 };
 
 struct avr_policy_reqs {
@@ -101,6 +111,16 @@ struct avr_policy_reqs {
 
 /* indexed by policy->cpu, the policy's owning CPU */
 static struct avr_policy_reqs reqs[NR_CPUS];
+static bool applied;				/* a mode was applied at least once */
+
+/* Smart Balanced state */
+#define SMART_HOLD_MS	1000
+static unsigned int smart_cap = 80;		/* % of max while idle; 100 = off */
+static bool smart_active;			/* the mode in effect uses it */
+static bool smart_lifted;			/* cap currently lifted */
+static bool smart_armed;			/* first touch seen: boot is over */
+static unsigned long last_kick;			/* jiffies of the last touch/launch */
+
 static enum avr_mode cur_mode = AVR_BALANCED;	/* in effect */
 static enum avr_mode base_mode = AVR_BALANCED;	/* chosen by the user */
 static DEFINE_MUTEX(avr_lock);
@@ -179,6 +199,8 @@ static void apply_policy(struct cpufreq_policy *policy,
 
 	if (m->eff_cap)
 		max = battery_cap(policy, m->max_pct, &from_em);
+	else if (m->smart && smart_armed && !smart_lifted && smart_cap < 100)
+		max = pct_of(fmax, smart_cap);
 
 	if (!r->added) {
 		if (freq_qos_add_request(&policy->constraints, &r->min,
@@ -198,9 +220,8 @@ static void apply_policy(struct cpufreq_policy *policy,
 }
 
 /* Called with avr_lock held. */
-static void apply_mode(enum avr_mode mode)
+static void apply_policies(const struct avr_mode_params *m)
 {
-	const struct avr_mode_params *m = &modes[mode];
 	unsigned int cpu;
 
 	for_each_possible_cpu(cpu) {
@@ -212,6 +233,16 @@ static void apply_mode(enum avr_mode mode)
 			apply_policy(policy, m);
 		cpufreq_cpu_put(policy);
 	}
+}
+
+/* Called with avr_lock held. */
+static void apply_mode(enum avr_mode mode)
+{
+	const struct avr_mode_params *m = &modes[mode];
+
+	applied = true;
+	WRITE_ONCE(smart_active, m->smart);
+	apply_policies(m);
 
 	sched_pelt_set_multiplier(m->pelt_mult);
 	launch_boost_set(m->launch_uclamp);
@@ -221,9 +252,11 @@ static void apply_mode(enum avr_mode mode)
 	 * scheduler may tune it): longer slices mean fewer context switches
 	 * and less cache churn, shorter ones mean quicker wakeup preemption.
 	 */
-	if (!stock_slice)
+	if (m->slice_pct != 100 && !stock_slice)
+		/* captured late (first real change), after vendor init tuned it */
 		stock_slice = READ_ONCE(sysctl_sched_base_slice);
-	WRITE_ONCE(sysctl_sched_base_slice, stock_slice / 100 * m->slice_pct);
+	if (stock_slice)
+		WRITE_ONCE(sysctl_sched_base_slice, stock_slice / 100 * m->slice_pct);
 	WRITE_ONCE(dirty_writeback_interval, m->writeback_cs);
 	rk_tboost_set_headroom(m->tboost_pct);
 
@@ -243,7 +276,7 @@ static int avr_policy_notifier(struct notifier_block *nb, unsigned long event,
 	mutex_lock(&avr_lock);
 	if (event == CPUFREQ_CREATE_POLICY) {
 		/* a policy (re)appeared: bring it in line with the current mode */
-		if (!r->added && cur_mode != AVR_BALANCED)
+		if (!r->added && applied)
 			apply_policy(policy, &modes[cur_mode]);
 	} else if (event == CPUFREQ_REMOVE_POLICY && r->added) {
 		freq_qos_remove_request(&r->min);
@@ -257,6 +290,118 @@ static int avr_policy_notifier(struct notifier_block *nb, unsigned long event,
 
 static struct notifier_block avr_policy_nb = {
 	.notifier_call = avr_policy_notifier,
+};
+
+/* ---- Smart Balanced ----------------------------------------------------- */
+
+static void smart_drop_fn(struct work_struct *work);
+static DECLARE_DEFERRABLE_WORK(smart_drop_work, smart_drop_fn);
+
+static void smart_lift_fn(struct work_struct *work)
+{
+	mutex_lock(&avr_lock);
+	if (smart_active && !smart_lifted) {
+		smart_lifted = true;
+		apply_policies(&modes[cur_mode]);
+	}
+	mutex_unlock(&avr_lock);
+	mod_delayed_work(system_unbound_wq, &smart_drop_work,
+			 msecs_to_jiffies(SMART_HOLD_MS));
+}
+static DECLARE_WORK(smart_lift_work, smart_lift_fn);
+
+/* Re-cap once SMART_HOLD_MS passed without a touch; deferrable, so idle CPUs stay idle. */
+static void smart_drop_fn(struct work_struct *work)
+{
+	unsigned long hold = msecs_to_jiffies(SMART_HOLD_MS);
+	unsigned long since = jiffies - READ_ONCE(last_kick);
+
+	if (since < hold) {
+		mod_delayed_work(system_unbound_wq, &smart_drop_work, hold - since);
+		return;
+	}
+
+	mutex_lock(&avr_lock);
+	if (smart_lifted) {
+		smart_lifted = false;
+		if (smart_active)
+			apply_policies(&modes[cur_mode]);
+	}
+	mutex_unlock(&avr_lock);
+}
+
+/* Touch or app launch: cheap enough to call from input event context. */
+void avr_profile_kick(void)
+{
+	WRITE_ONCE(last_kick, jiffies);
+	if (READ_ONCE(smart_active) && !READ_ONCE(smart_lifted))
+		queue_work(system_highpri_wq, &smart_lift_work);
+}
+
+static void smart_input_event(struct input_handle *handle, unsigned int type,
+			      unsigned int code, int value)
+{
+	if (type == EV_ABS || (type == EV_KEY && code == BTN_TOUCH)) {
+		/* nobody touches the screen while booting: start capping now */
+		if (unlikely(!READ_ONCE(smart_armed)))
+			WRITE_ONCE(smart_armed, true);
+		avr_profile_kick();
+	}
+}
+
+static int smart_input_connect(struct input_handler *handler,
+			       struct input_dev *dev,
+			       const struct input_device_id *id)
+{
+	struct input_handle *handle;
+	int ret;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "rakkashin_smart";
+
+	ret = input_register_handle(handle);
+	if (ret)
+		goto err_free;
+	ret = input_open_device(handle);
+	if (ret)
+		goto err_unregister;
+	return 0;
+
+err_unregister:
+	input_unregister_handle(handle);
+err_free:
+	kfree(handle);
+	return ret;
+}
+
+static void smart_input_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+/* touchscreens only: multitouch position axes */
+static const struct input_device_id smart_input_ids[] = {
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.evbit = { BIT_MASK(EV_ABS) },
+		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] = BIT_MASK(ABS_MT_POSITION_X) },
+	},
+	{ },
+};
+
+static struct input_handler smart_input_handler = {
+	.event		= smart_input_event,
+	.connect	= smart_input_connect,
+	.disconnect	= smart_input_disconnect,
+	.name		= "rakkashin_smart",
+	.id_table	= smart_input_ids,
 };
 
 /* ---- per-app profiles ------------------------------------------------- */
@@ -434,6 +579,31 @@ static ssize_t status_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute status_attr = __ATTR_RO(status);
 
+static ssize_t smart_cap_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(smart_cap));
+}
+
+/* 50..100; 100 turns Smart Balanced off */
+static ssize_t smart_cap_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	unsigned int v;
+
+	if (kstrtouint(buf, 10, &v) || v < 50 || v > 100)
+		return -EINVAL;
+
+	mutex_lock(&avr_lock);
+	WRITE_ONCE(smart_cap, v);
+	if (smart_active)
+		apply_policies(&modes[cur_mode]);
+	mutex_unlock(&avr_lock);
+	return count;
+}
+
+static struct kobj_attribute smart_cap_attr = __ATTR_RW(smart_cap);
+
 /* per cluster: "cpuN: <cap kHz>/<max kHz> (energy-model|fallback)" */
 static ssize_t battery_caps_show(struct kobject *kobj,
 				 struct kobj_attribute *attr, char *buf)
@@ -551,6 +721,7 @@ static struct attribute *avr_profile_attrs[] = {
 	&app_profiles_attr.attr,
 	&status_attr.attr,
 	&battery_caps_attr.attr,
+	&smart_cap_attr.attr,
 	NULL
 };
 
@@ -574,6 +745,18 @@ static int __init avr_profile_init(void)
 	}
 
 	avr_kobj = kobj;
+
+	/*
+	 * Run balanced from the start, so Smart Balanced works without the
+	 * control module; cpufreq policies created later pick it up through
+	 * the policy notifier. The cap itself waits for the first touch.
+	 */
+	mutex_lock(&avr_lock);
+	apply_mode(AVR_BALANCED);
+	mutex_unlock(&avr_lock);
+
+	if (input_register_handler(&smart_input_handler))
+		pr_warn("rakkashin: no touch input handler, Smart Balanced stays capped\n");
 	pr_info("%s\n", RAKKASHIN_VERSION);
 	return cpufreq_register_notifier(&avr_policy_nb, CPUFREQ_POLICY_NOTIFIER);
 }

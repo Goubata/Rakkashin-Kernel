@@ -18,10 +18,15 @@ by **Rakkashin**
 | | CPU frequency | PELT | Launch boost | Thread boost | Sched slice | Writeback | Background apps |
 |---|---|---|---|---|---|---|---|
 | battery | capped at the Energy Model efficiency knee | 32 ms | gentle (62%) | off | 2× | 30 s | heavily limited |
-| balanced | stock | 16 ms | full | off | stock | 15 s | capped at 50% |
+| smart balanced | 80% while not touched, 100% on touch | 16 ms | full | off | stock | 15 s | capped at 50% |
 | performance | floor 30% | 8 ms | full | +15% | 0.7× | 15 s | stock |
 | game | floor 50% | 8 ms | full | +25% | 0.7× | 15 s | limited |
 
+- **Smart Balanced** (default): while nobody touches the screen the CPUs are
+  capped at 80% (the least efficient top of the frequency range); an
+  in-kernel touch handler lifts the cap the instant a finger lands, and app
+  launches lift it too. Full speed while you interact, efficient otherwise.
+  Works without the control module.
 - **Per-app profiles**: give any app its own profile; it applies while that app
   is in the foreground (decided in-kernel on cpuset attach, no polling).
 - **Thread boost**: the heaviest foreground threads get a uclamp floor of

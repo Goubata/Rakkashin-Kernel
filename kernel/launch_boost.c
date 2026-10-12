@@ -25,6 +25,7 @@
  *   /sys/module/launch_boost/parameters/uclamp_min   (0..1024, default 1024)
  */
 
+#include <linux/avr_profile.h>
 #include <linux/launch_boost.h>
 #include <linux/moduleparam.h>
 #include <linux/sched.h>
@@ -157,6 +158,9 @@ void launch_boost_setuid(uid_t old_uid, uid_t new_uid)
 		kfree(lb);
 		return;
 	}
+
+	/* Smart Balanced: lift the idle cap for the launch too */
+	avr_profile_kick();
 
 	get_task_struct(p);
 	lb->p = p;

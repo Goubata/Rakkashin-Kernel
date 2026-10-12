@@ -9,6 +9,7 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 [ -e "$K/mode" ] || exit 0
 
 [ -f "$STATE/mode" ] && sh "$MODDIR/apply.sh" "$(cat "$STATE/mode")"
+[ -f "$STATE/smart_cap" ] && cat "$STATE/smart_cap" > "$K/smart_cap"
 [ -f "$STATE/app_profiles" ] && cat "$STATE/app_profiles" > "$K/app_profiles"
 [ -f "$STATE/per_app" ] && cat "$STATE/per_app" > "$K/per_app"
 [ -f "$STATE/fsync" ] && cat "$STATE/fsync" > /sys/module/sync/parameters/fsync_enabled
