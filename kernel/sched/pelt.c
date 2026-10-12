@@ -561,14 +561,30 @@ done:
 	return ret;
 }
 
-/* For in-kernel policy (avr_profile): multiplier 1, 2 or 4. */
+/*
+ * For in-kernel policy (avr_profile): multiplier 1, 2 or 4. Goes through the
+ * same vendor hook as the sysctl, so a vendor scheduler can still veto it.
+ */
 int sched_pelt_set_multiplier(unsigned int mult)
 {
+	static DEFINE_MUTEX(set_mutex);
+	unsigned int old;
+	int ret = 0;
+
 	if (mult != 1 && mult != 2 && mult != 4)
 		return -EINVAL;
-	WRITE_ONCE(sysctl_sched_pelt_multiplier, mult);
-	WRITE_ONCE(sched_pelt_lshift, mult >> 1);
-	return 0;
+
+	mutex_lock(&set_mutex);
+	old = READ_ONCE(sysctl_sched_pelt_multiplier);
+	if (old != mult) {
+		trace_android_vh_sched_pelt_multiplier(old, mult, &ret);
+		if (!ret) {
+			WRITE_ONCE(sysctl_sched_pelt_multiplier, mult);
+			WRITE_ONCE(sched_pelt_lshift, mult >> 1);
+		}
+	}
+	mutex_unlock(&set_mutex);
+	return ret;
 }
 
 static struct ctl_table sched_pelt_sysctls[] = {
