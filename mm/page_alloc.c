@@ -324,7 +324,11 @@ int min_free_kbytes = 1024;
 int user_min_free_kbytes = -1;
 /* 0: no boosted reclaim on fragmentation events, less kswapd churn (LawRun) */
 static int watermark_boost_factor __read_mostly;
-static int watermark_scale_factor = 10;
+/*
+ * 50 (0.5% of RAM, ~80MB on avr) instead of 10: kswapd starts earlier, so
+ * app launches hit direct reclaim (a major jank source) far less often.
+ */
+static int watermark_scale_factor = 50;
 
 /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
 int movable_zone;
