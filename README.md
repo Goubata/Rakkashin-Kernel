@@ -17,9 +17,9 @@ by **Rakkashin**
 
 | | CPU frequency | PELT | Launch boost | Thread boost | Sched slice | Writeback | Background apps |
 |---|---|---|---|---|---|---|---|
-| battery | capped at the Energy Model efficiency knee | 32 ms | gentle (62%) | off | 2× | 30 s | heavily limited |
-| smart balanced | 80% while not touched, 100% on touch | 16 ms | full | off | stock | 15 s | capped at 50% |
-| performance | floor 30% | 8 ms | full | +15% | 0.7× | 15 s | stock |
+| battery | Energy Model efficiency knee; demand-matched when not touched | 32 ms | gentle (62%) | off | 2× | 30 s | heavily limited |
+| smart balanced | demand-matched (≤80%) while not touched, 100% on touch | 16 ms | full | off | stock | 15 s | capped at 50% |
+| performance | floor 30% while touched | 8 ms | full | +15% | 0.7× | 15 s | stock |
 | game | floor 50% | 8 ms | full | +25% | 0.7× | 15 s | limited |
 
 - **Smart Balanced** (default): while nobody touches the screen the CPUs are
@@ -27,6 +27,14 @@ by **Rakkashin**
   in-kernel touch handler lifts the cap the instant a finger lands, and app
   launches lift it too. Full speed while you interact, efficient otherwise.
   Works without the control module.
+- **Demand-matched frequency**: while the screen isn't touched, Battery and
+  Smart Balanced cap each cluster at the frequency its busiest CPU actually
+  needs (measured utilization + 25%), re-evaluated every 100 ms. The vendor
+  governor can no longer overshoot, so the same work runs at lower
+  frequency and voltage; real load growth raises the cap within a few
+  hundred ms.
+- **Power limit**: keep battery drain under a set wattage (WebUI); the
+  kernel measures it every second and steps the CPU cap down or up.
 - **Per-app profiles**: give any app its own profile; it applies while that app
   is in the foreground (decided in-kernel on cpuset attach, no polling).
 - **Thread boost**: the heaviest foreground threads get a uclamp floor of

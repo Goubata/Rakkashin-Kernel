@@ -54,6 +54,7 @@
 #include <linux/launch_boost.h>
 #include <linux/mutex.h>
 #include <linux/pm_qos.h>
+#include <linux/power_supply.h>
 #include <linux/rk_tboost.h>
 #include <linux/sched/sysctl.h>
 #include <linux/string.h>
@@ -62,9 +63,10 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.0 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.1 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
+extern unsigned long rk_cpu_util(int cpu);
 extern unsigned int sysctl_sched_base_slice;
 static unsigned int stock_slice;	/* captured before the first change */
 
@@ -87,6 +89,8 @@ struct avr_mode_params {
 	unsigned int tboost_pct;	/* foreground thread headroom boost, 0 = off */
 	unsigned int slice_pct;		/* EEVDF base slice, % of the stock value */
 	bool smart;			/* touch-aware smart_cap applies */
+	bool demand;			/* cap at measured demand + headroom when idle */
+	bool floor_touch;		/* min_pct only while the screen is touched */
 };
 
 static const char * const mode_names[AVR_NR_MODES] = {
@@ -97,10 +101,11 @@ static const char * const mode_names[AVR_NR_MODES] = {
 };
 
 static const struct avr_mode_params modes[AVR_NR_MODES] = {
-	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1,  640, 3000,  0, 200, false },
-	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, 1024, 1500,  0, 100, true  },
-	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, 1024, 1500, 15,  70, false },
-	[AVR_GAME]	  = { "game",		50, 100, false, 4, 1024, 1500, 25,  70, false },
+	/*                                 min max  eff   pelt launch  wb   tb  slice smart  demand floor_touch */
+	[AVR_BATTERY]	  = { "battery",	 0,  70, true,  1,  640, 3000,  0, 200, false, true,  false },
+	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, 1024, 1500,  0, 100, true,  true,  false },
+	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, 1024, 1500, 15,  70, false, false, true  },
+	[AVR_GAME]	  = { "game",		50, 100, false, 4, 1024, 1500, 25,  70, false, false, false },
 };
 
 struct avr_policy_reqs {
@@ -120,6 +125,16 @@ static bool smart_active;			/* the mode in effect uses it */
 static bool smart_lifted;			/* cap currently lifted */
 static bool smart_armed;			/* first touch seen: boot is over */
 static unsigned long last_kick;			/* jiffies of the last touch/launch */
+
+/* demand cap and power limit, re-evaluated by gov_work */
+#define GOV_MS			100
+#define DEMAND_HEADROOM_PCT	25	/* above measured utilization */
+#define DEMAND_FLOOR_PCT	30	/* never cap below this share of max */
+#define POWER_EVERY		10	/* measure power every POWER_EVERY ticks */
+#define POWER_MIN_PCT		30
+static unsigned int power_limit_mw;		/* 0 = off */
+static unsigned int power_pct = 100;		/* CPU cap from the power loop */
+static unsigned int power_now_mw;		/* last measurement */
 
 static enum avr_mode cur_mode = AVR_BALANCED;	/* in effect */
 static enum avr_mode base_mode = AVR_BALANCED;	/* chosen by the user */
@@ -187,20 +202,54 @@ static s32 battery_cap(struct cpufreq_policy *policy, unsigned int pct,
 	return clamp_t(s32, knee, pct_of(fmax, EFF_MIN_PCT), pct_of(fmax, EFF_MAX_PCT));
 }
 
+/*
+ * Frequency (kHz) this policy needs for its busiest CPU's current load plus
+ * DEMAND_HEADROOM_PCT: utilization is frequency-invariant, so util/capacity
+ * of max frequency does the work, with headroom to absorb growth until the
+ * next evaluation. If the load grows, util rises at the capped frequency and
+ * the cap follows by up to the headroom each GOV_MS.
+ */
+static s32 demand_khz(struct cpufreq_policy *policy)
+{
+	unsigned long need = 0;
+	unsigned int cpu;
+
+	for_each_cpu(cpu, policy->cpus) {
+		unsigned long cap = arch_scale_cpu_capacity(cpu);
+		unsigned long u = min(rk_cpu_util(cpu), cap);
+
+		need = max(need, u * policy->cpuinfo.max_freq / max(cap, 1UL));
+	}
+	return (s32)min_t(unsigned long, need * (100 + DEMAND_HEADROOM_PCT) / 100,
+			  policy->cpuinfo.max_freq);
+}
+
 /* Called with avr_lock held. */
 static void apply_policy(struct cpufreq_policy *policy,
 			 const struct avr_mode_params *m)
 {
 	struct avr_policy_reqs *r = &reqs[policy->cpu];
 	unsigned int fmax = policy->cpuinfo.max_freq;
-	s32 min = m->min_pct ? pct_of(fmax, m->min_pct) : FREQ_QOS_MIN_DEFAULT_VALUE;
-	s32 max = m->max_pct < 100 ? pct_of(fmax, m->max_pct) : FREQ_QOS_MAX_DEFAULT_VALUE;
+	bool idle = smart_armed && !smart_lifted;	/* no touch right now */
+	s32 min = FREQ_QOS_MIN_DEFAULT_VALUE;
+	s32 max = fmax;
 	bool from_em;
+
+	if (m->min_pct && (!m->floor_touch || !idle))
+		min = pct_of(fmax, m->min_pct);
 
 	if (m->eff_cap)
 		max = battery_cap(policy, m->max_pct, &from_em);
-	else if (m->smart && smart_armed && !smart_lifted && smart_cap < 100)
-		max = pct_of(fmax, smart_cap);
+	else if (m->max_pct < 100)
+		max = pct_of(fmax, m->max_pct);
+	if (m->smart && idle && smart_cap < 100)
+		max = min(max, pct_of(fmax, smart_cap));
+	if (m->demand && idle)
+		max = min(max, max(demand_khz(policy), pct_of(fmax, DEMAND_FLOOR_PCT)));
+	if (power_pct < 100)
+		max = min(max, pct_of(fmax, power_pct));
+	if (max >= (s32)fmax)
+		max = FREQ_QOS_MAX_DEFAULT_VALUE;
 
 	if (!r->added) {
 		if (freq_qos_add_request(&policy->constraints, &r->min,
@@ -216,7 +265,31 @@ static void apply_policy(struct cpufreq_policy *policy,
 	}
 
 	freq_qos_update_request(&r->min, min);
+	/*
+	 * The demand cap is re-evaluated every GOV_MS; skip changes below ~3%
+	 * of max so load jitter doesn't churn cpufreq limit updates. Lifting
+	 * the cap entirely always goes through.
+	 */
+	if (max != FREQ_QOS_MAX_DEFAULT_VALUE &&
+	    r->max.pnode.prio != FREQ_QOS_MAX_DEFAULT_VALUE &&
+	    abs(max - r->max.pnode.prio) < (s32)(fmax / 32))
+		return;
 	freq_qos_update_request(&r->max, max);
+}
+
+static void gov_fn(struct work_struct *work);
+static DECLARE_DEFERRABLE_WORK(gov_work, gov_fn);
+
+/* the loop is needed while a demand cap is live or a power limit is set */
+static bool gov_needed(void)
+{
+	return (modes[cur_mode].demand && smart_armed && !smart_lifted) ||
+	       READ_ONCE(power_limit_mw);
+}
+
+static void gov_kick(void)
+{
+	mod_delayed_work(system_unbound_wq, &gov_work, msecs_to_jiffies(GOV_MS));
 }
 
 /* Called with avr_lock held. */
@@ -241,8 +314,9 @@ static void apply_mode(enum avr_mode mode)
 	const struct avr_mode_params *m = &modes[mode];
 
 	applied = true;
-	WRITE_ONCE(smart_active, m->smart);
+	WRITE_ONCE(smart_active, m->smart || m->demand || m->floor_touch);
 	apply_policies(m);
+	gov_kick();
 
 	sched_pelt_set_multiplier(m->pelt_mult);
 	launch_boost_set(m->launch_uclamp);
@@ -292,6 +366,60 @@ static struct notifier_block avr_policy_nb = {
 	.notifier_call = avr_policy_notifier,
 };
 
+/* ---- demand cap and power limit loop ---------------------------------- */
+
+/* Battery discharge power in mW, or 0 if unknown or charging. May sleep. */
+static unsigned int battery_mw(void)
+{
+	struct power_supply *psy = power_supply_get_by_name("battery");
+	union power_supply_propval i, v, st;
+	unsigned int mw = 0;
+
+	if (!psy)
+		return 0;
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &st) &&
+	    st.intval != POWER_SUPPLY_STATUS_CHARGING &&
+	    st.intval != POWER_SUPPLY_STATUS_FULL &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &i) &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v))
+		/* uA * uV = pW; / 1e9 = mW */
+		mw = div_u64((u64)abs(i.intval) * (u64)abs(v.intval), 1000000000);
+	power_supply_put(psy);
+	return mw;
+}
+
+static void gov_fn(struct work_struct *work)
+{
+	static unsigned int tick;
+	unsigned int limit = READ_ONCE(power_limit_mw);
+	unsigned int mw = 0;
+	bool measure = limit && ++tick % POWER_EVERY == 0;
+
+	/* outside avr_lock: the battery driver may talk to firmware */
+	if (measure)
+		mw = battery_mw();
+
+	mutex_lock(&avr_lock);
+	if (!limit) {
+		power_pct = 100;
+	} else if (measure) {
+		power_now_mw = mw;
+		if (!mw)
+			power_pct = 100;	/* charging or unknown: nothing to limit */
+		else if (mw > limit)
+			/* step down harder the further over we are */
+			power_pct = max_t(int, POWER_MIN_PCT, (int)power_pct -
+					  (int)clamp_t(unsigned int,
+						       (mw - limit) * 50 / limit, 5, 20));
+		else if (mw < limit * 85 / 100)
+			power_pct = min(100U, power_pct + 5);
+	}
+	apply_policies(&modes[cur_mode]);
+	if (gov_needed())
+		gov_kick();
+	mutex_unlock(&avr_lock);
+}
+
 /* ---- Smart Balanced ----------------------------------------------------- */
 
 static void smart_drop_fn(struct work_struct *work);
@@ -326,6 +454,8 @@ static void smart_drop_fn(struct work_struct *work)
 		smart_lifted = false;
 		if (smart_active)
 			apply_policies(&modes[cur_mode]);
+		if (gov_needed())
+			gov_kick();
 	}
 	mutex_unlock(&avr_lock);
 }
@@ -604,6 +734,38 @@ static ssize_t smart_cap_store(struct kobject *kobj, struct kobj_attribute *attr
 
 static struct kobj_attribute smart_cap_attr = __ATTR_RW(smart_cap);
 
+/* "limit=<mW> now=<mW> cpu_cap=<%>"; write a limit in mW, 0 = off */
+static ssize_t power_limit_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "limit=%u now=%u cpu_cap=%u\n",
+			  READ_ONCE(power_limit_mw), READ_ONCE(power_now_mw),
+			  READ_ONCE(power_pct));
+}
+
+static ssize_t power_limit_store(struct kobject *kobj,
+				 struct kobj_attribute *attr,
+				 const char *buf, size_t count)
+{
+	unsigned int v;
+
+	if (kstrtouint(buf, 10, &v) || (v && v < 500) || v > 30000)
+		return -EINVAL;
+
+	mutex_lock(&avr_lock);
+	WRITE_ONCE(power_limit_mw, v);
+	if (!v) {
+		power_pct = 100;
+		power_now_mw = 0;
+		apply_policies(&modes[cur_mode]);
+	}
+	gov_kick();
+	mutex_unlock(&avr_lock);
+	return count;
+}
+
+static struct kobj_attribute power_limit_attr = __ATTR_RW(power_limit);
+
 /* per cluster: "cpuN: <cap kHz>/<max kHz> (energy-model|fallback)" */
 static ssize_t battery_caps_show(struct kobject *kobj,
 				 struct kobj_attribute *attr, char *buf)
@@ -722,6 +884,7 @@ static struct attribute *avr_profile_attrs[] = {
 	&status_attr.attr,
 	&battery_caps_attr.attr,
 	&smart_cap_attr.attr,
+	&power_limit_attr.attr,
 	NULL
 };
 

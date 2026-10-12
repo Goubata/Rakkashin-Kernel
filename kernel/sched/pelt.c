@@ -562,6 +562,21 @@ done:
 }
 
 /*
+ * For avr_profile's demand cap: a CPU's current CFS + RT utilization,
+ * frequency-invariant, in capacity units. CFS uses the larger of the PELT
+ * average and util_est so a periodic load is counted at its peak. Lockless;
+ * a slightly stale value is fine for a 100ms policy loop.
+ */
+unsigned long rk_cpu_util(int cpu)
+{
+	struct rq *rq = cpu_rq(cpu);
+	unsigned long cfs = max_t(unsigned long, READ_ONCE(rq->cfs.avg.util_avg),
+				  READ_ONCE(rq->cfs.avg.util_est));
+
+	return cfs + READ_ONCE(rq->avg_rt.util_avg);
+}
+
+/*
  * For in-kernel policy (avr_profile): multiplier 1, 2 or 4. Goes through the
  * same vendor hook as the sysctl, so a vendor scheduler can still veto it.
  */
