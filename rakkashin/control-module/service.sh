@@ -16,6 +16,9 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 [ -f "$STATE/launch_boost" ] && cat "$STATE/launch_boost" > /sys/module/launch_boost/parameters/enabled
 [ -f "$STATE/wl_block" ] && cat "$STATE/wl_block" > /sys/class/misc/boeffla_wakelock_blocker/wakelock_blocker
 
+# Keep more apps cached (default on; "0" in $STATE/lmk disables it)
+[ "$(cat "$STATE/lmk" 2>/dev/null)" != 0 ] && sh "$MODDIR/lmk.sh" apply
+
 # Two-stage zram (default on; "0" in $STATE/zram2 disables it next boot)
 if [ "$(cat "$STATE/zram2" 2>/dev/null)" != 0 ]; then
 	sh "$MODDIR/zram.sh" setup && sh "$MODDIR/zram.sh" loop &

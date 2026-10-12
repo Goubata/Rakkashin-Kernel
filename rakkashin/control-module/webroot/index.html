@@ -74,6 +74,10 @@
     <input type="checkbox" id="tb">
   </div>
   <div class="row">
+    <div><b data-i18n="lmk_title"></b><div class="sub" data-i18n="lmk_desc"></div></div>
+    <input type="checkbox" id="lmk">
+  </div>
+  <div class="row">
     <div><b data-i18n="z_title"></b><div class="sub" data-i18n="z_desc"></div></div>
     <input type="checkbox" id="zram2">
   </div>
@@ -110,6 +114,10 @@ const T = {
     balanced: ["バランス", "標準（初期値）"],
     performance: ["パフォーマンス", "周波数下限30%・反応速め・スレッドブースト+15%"],
     game: ["ゲーム", "下限50%・前面アプリ優先・スレッドブースト+25%"],
+    lmk_title: "アプリを RAM に多く残す",
+    lmk_desc: "16GB 向けにアプリの自動終了を控えめにし、裏に残すアプリを最大64個にします。アプリに戻ったときの再起動が減ります。",
+    lmk_on: "オンにしました",
+    lmk_off: "元の設定に戻しました",
     z_title: "zram 2段圧縮",
     z_desc: "普段は速い lzo-rle で圧縮し、30分使われなかったデータだけ zstd で詰め直します。より多くのアプリを RAM に残せます。切り替えは再起動後に反映されます。",
     z_saved: "保存しました（再起動後に反映されます）",
@@ -119,7 +127,7 @@ const T = {
     failed: "失敗しました: ",
     unsupported: "このカーネルは Rakkashin Kernel ではありません。",
     lb_title: "アプリ起動ブースト",
-    lb_desc: "アプリの起動直後、1秒だけ CPU を全開にします。プロファイルを切り替えると、そのプロファイルの既定値に戻ります。",
+    lb_desc: "アプリの起動直後、起動処理が落ち着くまで（0.3〜2秒）CPU を全開にします。プロファイルを切り替えると、そのプロファイルの既定値に戻ります。",
     fsync_desc: "オフにすると書き込みが速くなりますが、突然の電源断でデータが壊れることがあります。",
     wl_title: "Wakelock",
     wl_desc: "スリープを妨げている時間が長い順です。チェックした wakelock はブロックされます。通知や通信に必要なものを止めると不具合が出ることがあります。",
@@ -141,6 +149,10 @@ const T = {
     balanced: ["Balanced", "Default"],
     performance: ["Performance", "30% frequency floor, faster response, thread boost +15%"],
     game: ["Game", "50% floor, foreground first, thread boost +25%"],
+    lmk_title: "Keep more apps in RAM",
+    lmk_desc: "Kills background apps less eagerly (tuned for 16GB) and keeps up to 64 cached apps, so switching back doesn't restart them.",
+    lmk_on: "Enabled",
+    lmk_off: "Restored the original settings",
     z_title: "Two-stage zram",
     z_desc: "Swaps with fast lzo-rle, then re-packs data untouched for 30 minutes with zstd, so more apps stay in RAM. Takes effect after a reboot.",
     z_saved: "Saved (takes effect after a reboot)",
@@ -150,7 +162,7 @@ const T = {
     failed: "Failed: ",
     unsupported: "This kernel is not Rakkashin Kernel.",
     lb_title: "App launch boost",
-    lb_desc: "Runs the CPU flat out for 1 second right after an app starts. Switching profiles resets it to that profile's default.",
+    lb_desc: "Runs the CPU flat out right after an app starts, until its launch work settles (0.3–2 s). Switching profiles resets it to that profile's default.",
     fsync_desc: "Off makes writes faster, but a sudden power loss can corrupt data.",
     wl_title: "Wakelocks",
     wl_desc: "Sorted by how long each kept the phone awake. Checked wakelocks are blocked. Blocking ones needed for notifications or networking can break things.",
@@ -323,6 +335,13 @@ async function init() {
   bindToggle("fsync", FSYNC, "fsync");
   bindToggle("lb", LB, "launch_boost");
   bindToggle("tb", TB, "tboost");
+  const lmk = document.getElementById("lmk");
+  lmk.checked = (await exec(`cat ${STATE}/lmk 2>/dev/null`)).stdout.trim() !== "0";
+  lmk.onchange = async () => {
+    const on = lmk.checked;
+    await exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/lmk && sh ${MODDIR}/lmk.sh ${on ? "apply" : "revert"}`);
+    status(on ? T.lmk_on : T.lmk_off);
+  };
   const z = document.getElementById("zram2");
   z.checked = (await exec(`cat ${STATE}/zram2 2>/dev/null`)).stdout.trim() !== "0";
   z.onchange = async () => {
