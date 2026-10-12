@@ -1,21 +1,12 @@
-# avr custom kernel: KernelSU-Next + SUSFS + KMI-safe power/perf tweaks
+# avr custom kernel: KernelSU-Next + KMI-safe power/perf tweaks
 # Everything here must stay KMI-neutral so the stock vendor_dlkm/system_dlkm
 # modules keep loading.
 
-# --- root / hiding ---
+# --- root ---
 CONFIG_KSU=y
-CONFIG_KSU_SUSFS=y
-CONFIG_KSU_SUSFS_SUS_PATH=y
-CONFIG_KSU_SUSFS_SUS_MOUNT=y
-CONFIG_KSU_SUSFS_SUS_KSTAT=y
-CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
-CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-CONFIG_KSU_SUSFS_SUS_MAP=y
-CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
-# susfs logs every hidden-path hit via printk by default: wasted CPU wakeups
-# and an easy detection vector in dmesg.
-# CONFIG_KSU_SUSFS_ENABLE_LOG is not set
+# SUSFS broke Chromium on this device: Chrome pages never finished loading and
+# every KernelSU WebUI rendered blank. Both work with KernelSU-Next alone.
+# CONFIG_KSU_SUSFS is not set
 
 # --- power ---
 # Let WQ_POWER_EFFICIENT workqueues run unbound so the scheduler can keep
