@@ -141,6 +141,7 @@ static unsigned int power_pct = 100;		/* CPU cap from the power loop */
 static unsigned int power_now_mw;		/* last measurement */
 static unsigned int power_base_mw;		/* non-CPU power, from measurements */
 static bool power_discharging;			/* last measurement was on battery */
+static unsigned int power_tick;			/* gov ticks since the limit was set */
 
 static enum avr_mode cur_mode = AVR_BALANCED;	/* in effect */
 static enum avr_mode base_mode = AVR_BALANCED;	/* chosen by the user */
@@ -302,7 +303,12 @@ static void apply_policy(struct cpufreq_policy *policy,
 		return;
 	}
 
-	freq_qos_update_request(&r->min, min);
+	/*
+	 * Only call into QoS on a real change: the loop runs every GOV_MS and
+	 * freq_qos_update_request() fires a vendor hook even when nothing moved.
+	 */
+	if (r->min.pnode.prio != min)
+		freq_qos_update_request(&r->min, min);
 	/*
 	 * Caps are re-evaluated every GOV_MS: skip *lowering* them by less than
 	 * ~3% of max so load jitter doesn't churn cpufreq limit updates. Any
@@ -311,7 +317,8 @@ static void apply_policy(struct cpufreq_policy *policy,
 	if (max < r->max.pnode.prio &&
 	    r->max.pnode.prio - max < (s32)(fmax / 32))
 		return;
-	freq_qos_update_request(&r->max, max);
+	if (r->max.pnode.prio != max)
+		freq_qos_update_request(&r->max, max);
 }
 
 static void gov_fn(struct work_struct *work);
@@ -548,10 +555,10 @@ static void power_update(unsigned int limit, bool measured, unsigned int mw)
 
 static void gov_fn(struct work_struct *work)
 {
-	static unsigned int tick;
 	unsigned int limit = READ_ONCE(power_limit_mw);
 	unsigned int mw = 0, cpu;
-	bool measure = limit && ++tick % POWER_EVERY == 1;
+	/* tick 1 after a (re)set measures at once, then every POWER_EVERY */
+	bool measure = limit && ++power_tick % POWER_EVERY == 1;
 
 	/* outside avr_lock: the battery driver may talk to firmware */
 	if (measure)
@@ -917,6 +924,10 @@ static ssize_t power_limit_store(struct kobject *kobj,
 
 	mutex_lock(&avr_lock);
 	WRITE_ONCE(power_limit_mw, v);
+	/* calibrate afresh: measure on the next tick, forget the old baseline */
+	power_tick = 0;
+	power_base_mw = 0;
+	power_discharging = false;
 	if (!v) {
 		power_pct = 100;
 		power_now_mw = 0;
