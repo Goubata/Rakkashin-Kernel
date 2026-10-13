@@ -35,21 +35,31 @@ by **Rakkashin**
   Works without the control module.
 - **Demand-matched frequency**: while the screen isn't touched, Battery and
   Smart Balanced cap each cluster at the frequency its busiest CPU actually
-  needs (measured utilization + 25%), re-evaluated every 20 ms. Rises at
-  once, jumps by half when a CPU saturates at the cap (full speed within
-  ~60 ms), falls only after 100 ms of lower load. The vendor governor can no
+  needs (measured utilization + 25%), re-evaluated every 20 ms from both
+  PELT utilization and the busy time of the last tick. Rises at once, jumps
+  by half when a CPU saturates at the cap, falls only after 100 ms of lower
+  load. The vendor governor can no
   longer overshoot, so the same work runs at lower frequency and voltage.
-- **Sustained performance** (WebUI toggle, off by default): the demand-matched
-  CPU and GPU caps stay on while the screen is touched too, with 40%
-  headroom (a touch still lifts everything for one 20 ms tick). Runs cooler,
-  so long gaming sessions throttle less. Combine with per-app profiles to
-  use it for chosen games only.
+- **Sustained performance** (WebUI toggle, off by default): thermal-aware.
+  While the phone is cool, touch means full speed as usual. Once the skin
+  temperature (front/back virtual sensors) reaches the start temperature
+  (default 40 °C, WebUI), the demand-matched CPU and GPU caps stay on while
+  the screen is touched too, with headroom shrinking from 70% to 30% over the
+  next 5 °C. Touched caps start from the top, jump back to the top as soon as
+  a CPU is busy for a whole 20 ms tick at the cap (or the GPU is saturated),
+  and only come down after a second of lower load, so frame bursts are not
+  squeezed. The phone runs only as fast as the work needs exactly when heat
+  builds up, so long sessions throttle less. Combine with per-app profiles
+  to use it for chosen games only.
 - **GPU efficiency**: the same idea for the GPU. `rk_gpud` (control module,
   `rakkashin/control-module/src/rk_gpud.c`) caps the GPU at the lowest kgsl
   frequency step that covers its measured load + 25% while the demand cap is
-  live, rising at once and jumping halfway to the top when saturated. It
-  sleeps in poll() on `/sys/kernel/avr_profile/demand_active` (sysfs_notify)
-  while inactive, so a touch lifts the GPU cap instantly.
+  live, rising at once and jumping halfway to the top when saturated (to the
+  top while touched). kgsl refreshes its busy figure about once a second, so
+  rk_gpud decides once per fresh reading against the clock averaged over the
+  same time. It sleeps in poll() on `/sys/kernel/avr_profile/demand_active`
+  (sysfs_notify; 0 off, 1 untouched, 2 touched) while inactive, so a touch
+  lifts the GPU cap instantly.
 - **Power limit**: keep battery drain under a set wattage (WebUI). CPU power
   is predicted every 20 ms from the Energy Model and the cap set to fit the
   budget left after non-CPU power, which a real battery reading calibrates
@@ -151,6 +161,7 @@ KernelSU-Next と、性能・効率・電池持ちのための独自機能を入
 
 - **プロファイル**: バッテリー / バランス / パフォーマンス / ゲームを切り替えます。
 - **アプリごとのプロファイル**: 設定したアプリが前面にある間だけ、そのプロファイルになります。
+- **持続パフォーマンス**: 本体が温まってきたら、操作中も CPU と GPU を必要な分だけに抑えて、発熱による性能低下を防ぎます。涼しいうちは全開です。
 - **スレッドブースト**: 前面アプリの重いスレッドに、先回りで性能の余裕を与えます。
 - **起動ブースト**: アプリの起動直後の1秒だけ、CPU を全開にします。
 - **zram 2段圧縮**: 速い lzo-rle と、詰め込みの zstd を組み合わせます。

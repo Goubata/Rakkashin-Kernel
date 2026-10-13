@@ -83,6 +83,14 @@
     <div><b data-i18n="sus_title"></b><div class="sub" data-i18n="sus_desc"></div></div>
     <input type="checkbox" id="sustained">
   </div>
+  <div class="row" id="sustemprow">
+    <div><b data-i18n="sust_title"></b><div class="sub" data-i18n="sust_desc"></div><div class="sub" id="susstate"></div></div>
+    <select id="sustemp">
+      <option value="36">36°C</option><option value="38">38°C</option>
+      <option value="40">40°C</option><option value="42">42°C</option>
+      <option value="44">44°C</option>
+    </select>
+  </div>
 </div>
 
 <div class="card">
@@ -156,7 +164,13 @@ const T = {
     caps: "バッテリーモードの上限周波数",
     balanced: ["スマートバランス", "操作中は全開・それ以外は必要な周波数だけ（初期値）"],
     sus_title: "持続パフォーマンス",
-    sus_desc: "バッテリーとスマートバランスで、画面に触れている間も CPU と GPU を必要な分だけ（余裕40%）に抑えます。発熱を抑えて、長時間のゲームでもフレームレートが落ちにくくなります。",
+    sus_desc: "バッテリーとスマートバランスで、本体が温まってきたら、画面に触れている間も CPU と GPU を必要な分だけに抑えます。涼しいうちは全開のままです。発熱による強制的な性能低下を防いで、長時間のゲームでもフレームレートを保ちます。",
+    sust_title: "抑え始める温度",
+    sust_desc: "本体の表面温度がこの温度になったら抑え始めます。熱くなるほど余裕を減らします（70% → 30%）。",
+    sust_saved: "抑え始める温度を変更しました",
+    sus_cool: (t) => `本体 ${t}°C：まだ涼しいので、操作中は全開です`,
+    sus_hot: (t, h) => `本体 ${t}°C：操作中も必要な分だけに抑えています（余裕 ${h}%）`,
+    sus_nosensor: (h) => `温度センサーがないため、常に抑えています（余裕 ${h}%）`,
     sus_on: "持続パフォーマンスをオンにしました",
     sus_off: "持続パフォーマンスをオフにしました",
     sc_title: "スマートバランスの上限",
@@ -215,7 +229,13 @@ const T = {
     caps: "Battery mode frequency caps",
     balanced: ["Smart Balanced", "Full speed while you touch, just the frequency needed otherwise (default)"],
     sus_title: "Sustained performance",
-    sus_desc: "In Battery and Smart Balanced, keeps CPU and GPU at just what's needed (40% headroom) even while you touch the screen. Runs cooler, so frame rates hold up in long gaming sessions.",
+    sus_desc: "In Battery and Smart Balanced, once the phone warms up, CPU and GPU are kept at just what's needed even while you touch the screen. Full speed while it's cool. Prevents thermal throttling, so frame rates hold up in long gaming sessions.",
+    sust_title: "Start at",
+    sust_desc: "Skin temperature where it starts. The hotter it gets, the less headroom (70% → 30%).",
+    sust_saved: "Start temperature changed",
+    sus_cool: (t) => `Phone at ${t}°C: still cool, full speed while you play`,
+    sus_hot: (t, h) => `Phone at ${t}°C: just what's needed while you play (${h}% headroom)`,
+    sus_nosensor: (h) => `No temperature sensor: always on (${h}% headroom)`,
     sus_on: "Sustained performance on",
     sus_off: "Sustained performance off",
     sc_title: "Smart Balanced cap",
@@ -445,6 +465,31 @@ async function init() {
     };
   } else {
     document.getElementById("susrow").style.display = "none";
+  }
+  const st = document.getElementById("sustemp");
+  const stv = await exec(`cat ${NODE}/sustained_temp`);
+  if (stv.errno === 0 && susv.errno === 0) {
+    st.value = stv.stdout.trim();
+    st.onchange = async () => {
+      await exec(`echo ${st.value} > ${NODE}/sustained_temp && mkdir -p ${STATE} && echo ${st.value} > ${STATE}/sustained_temp`);
+      status(T.sust_saved);
+    };
+    const showSus = async () => {
+      const el = document.getElementById("susstate");
+      if (!sus.checked) { el.textContent = ""; return; }
+      const m = (await exec(`cat ${NODE}/sustained_state`)).stdout
+        .match(/skin=(-|-?\d+) engaged=(\d) headroom=(\d+)/);
+      if (!m) { el.textContent = ""; return; }
+      if (m[1] === "-") el.textContent = m[2] === "1" ? T.sus_nosensor(m[3]) : "";
+      else {
+        const t = (Number(m[1]) / 1000).toFixed(1);
+        el.textContent = m[2] === "1" ? T.sus_hot(t, m[3]) : T.sus_cool(t);
+      }
+    };
+    showSus();
+    setInterval(() => { if (!document.hidden) showSus(); }, 2000);
+  } else {
+    document.getElementById("sustemprow").style.display = "none";
   }
   const sc = document.getElementById("smartcap");
   const scv = await exec(`cat ${NODE}/smart_cap`);

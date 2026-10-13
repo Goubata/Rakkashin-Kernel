@@ -2,6 +2,8 @@
 # Rakkashin Kernel diagnostics.
 # Run in Termux:  sh /sdcard/RakkashinKernel/rk_diag.sh
 # Use Smart Balanced and don't touch the screen while it samples (~15 s).
+# "sh rk_diag.sh play" samples for 30 s instead: start it, switch to a game
+# within 10 s and keep playing (checks Sustained performance while touched).
 # Per-app profiles are paused while sampling (Termux itself is in front),
 # then restored.
 # The report goes to /sdcard/RakkashinKernel/diag.txt (and is copied to an
@@ -9,8 +11,11 @@
 
 # needs root: re-run through su when started as a normal user
 if [ "$(id -u)" != 0 ]; then
-	exec su -c "sh '$0'"
+	exec su -c "sh '$0' $1"
 fi
+
+PLAY=0
+[ "$1" = play ] && PLAY=1
 
 OUT=/sdcard/RakkashinKernel/diag.txt
 COPY=/data/data/com.termux/files/home/.andronix/distros/ubuntu/rootfs/home/alex
@@ -23,13 +28,18 @@ PERAPP=$(cat $K/per_app 2>/dev/null)
 [ "$PERAPP" = 1 ] && echo 0 > $K/per_app
 trap '[ "$PERAPP" = 1 ] && echo 1 > $K/per_app' EXIT
 
-echo "Sampling for about 15 seconds. Don't touch the screen..."
-sleep 3
+if [ $PLAY = 1 ]; then
+	echo "Switch to your game now and keep playing for about 40 seconds..."
+	sleep 10
+else
+	echo "Sampling for about 15 seconds. Don't touch the screen..."
+	sleep 3
+fi
 
 {
 echo "== kernel"
 uname -r
-for f in version status demand_active sustained smart_cap power_limit; do
+for f in version status demand_active sustained sustained_temp sustained_state smart_cap power_limit; do
 	echo "$f: $(cat $K/$f 2>&1)"
 done
 cat $K/battery_caps 2>&1
@@ -68,9 +78,12 @@ for p in /sys/devices/system/cpu/cpufreq/policy*; do
 	echo "$p cur=$(cat "$p/scaling_cur_freq") min=$(cat "$p/scaling_min_freq") max=$(cat "$p/scaling_max_freq") hw=$(cat "$p/cpuinfo_max_freq")"
 done
 
-echo "== 10 s untouched sampling: cpu max per policy | gpu max clock busy"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-	echo "$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq | tr '\n' ' ')| $(cat $G/gpu_max_clock) $(cat $G/gpu_clock) $(cat $G/gpu_busy)"
+if [ $PLAY = 1 ]; then N=30; WHAT="while playing"; else N=10; WHAT="untouched"; fi
+echo "== $N s sampling $WHAT: cpu max per policy | gpu max clock busy | demand_active power | sustained"
+i=0
+while [ $i -lt $N ]; do
+	echo "$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq | tr '\n' ' ')| $(cat $G/gpu_max_clock) $(cat $G/gpu_clock) $(cat $G/gpu_busy) | $(cat $K/demand_active) $(cat $K/power_limit) | $(cat $K/sustained_state 2>/dev/null)"
+	i=$((i + 1))
 	sleep 1
 done
 

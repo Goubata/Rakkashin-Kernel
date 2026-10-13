@@ -10,6 +10,7 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 
 [ -f "$STATE/mode" ] && sh "$MODDIR/apply.sh" "$(cat "$STATE/mode")"
 [ -f "$STATE/power_limit" ] && cat "$STATE/power_limit" > "$K/power_limit"
+[ -f "$STATE/sustained_temp" ] && cat "$STATE/sustained_temp" > "$K/sustained_temp"
 [ -f "$STATE/sustained" ] && cat "$STATE/sustained" > "$K/sustained"
 [ -f "$STATE/smart_cap" ] && cat "$STATE/smart_cap" > "$K/smart_cap"
 [ -f "$STATE/app_profiles" ] && cat "$STATE/app_profiles" > "$K/app_profiles"
