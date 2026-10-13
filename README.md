@@ -21,7 +21,13 @@ by **Rakkashin**
 | smart balanced | demand-matched (≤80%) while not touched, 100% on touch | 16 ms | full | off | stock | 15 s | capped at 50% |
 | performance | floor 30% while touched | 8 ms | full | +15% | 0.7× | 15 s | stock |
 | game | floor 50% | 8 ms | full | +25% | 0.7× | 15 s | limited |
+| extreme | pinned at max; memory bus and GPU at top speed | 8 ms | full | +50% | stock | 15 s | 5% |
 
+- **Extreme**: benchmark-grade. CPUs pinned at max frequency (no ramp-up
+  between runs), memory/cache bus (bus_dcvs) and GPU (kgsl) held at top
+  speed, foreground apps guaranteed 60% capacity, background 5%. Much more
+  heat and drain; thermal limits still apply. Leaving Extreme restores the
+  stock bus and GPU settings, so no other profile is affected.
 - **Smart Balanced** (default): while nobody touches the screen the CPUs are
   capped at 80% (the least efficient top of the frequency range); an
   in-kernel touch handler lifts the cap the instant a finger lands, and app

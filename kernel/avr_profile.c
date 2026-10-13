@@ -12,6 +12,7 @@
  *   balanced     smart cap (below)  16 ms  uclamp 1024   15 s       off           100%
  *   performance  floor 30% of max   8 ms   uclamp 1024   15 s       +15%          70%
  *   game         floor 50% of max   8 ms   uclamp 1024   15 s       +25%          70%
+ *   extreme      pinned at max      8 ms   uclamp 1024   15 s       +50%          100%
  *
  * Per-app profiles: "mode" is the global profile. app_profiles maps app UIDs
  * to their own mode; when a task of such a UID is moved into the top-app
@@ -63,7 +64,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.3 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.4 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -75,6 +76,7 @@ enum avr_mode {
 	AVR_BALANCED,
 	AVR_PERFORMANCE,
 	AVR_GAME,
+	AVR_EXTREME,
 	AVR_NR_MODES,
 };
 
@@ -98,6 +100,7 @@ static const char * const mode_names[AVR_NR_MODES] = {
 	[AVR_BALANCED]	  = "balanced",
 	[AVR_PERFORMANCE] = "performance",
 	[AVR_GAME]	  = "game",
+	[AVR_EXTREME]	  = "extreme",
 };
 
 static const struct avr_mode_params modes[AVR_NR_MODES] = {
@@ -106,6 +109,12 @@ static const struct avr_mode_params modes[AVR_NR_MODES] = {
 	[AVR_BALANCED]	  = { "balanced",	 0, 100, false, 2, 1024, 1500,  0, 100, true,  true,  false },
 	[AVR_PERFORMANCE] = { "performance",	30, 100, false, 4, 1024, 1500, 15,  70, false, false, true  },
 	[AVR_GAME]	  = { "game",		50, 100, false, 4, 1024, 1500, 25,  70, false, false, false },
+	/*
+	 * extreme: benchmark-grade, heat be damned. CPUs pinned at max (no
+	 * ramp-up between benchmark runs), heaviest threads boosted +50%,
+	 * launch boost and fastest PELT. Thermal caps (QoS max) still win.
+	 */
+	[AVR_EXTREME]	  = { "extreme",	100, 100, false, 4, 1024, 1500, 50, 100, false, false, false },
 };
 
 struct avr_policy_reqs {

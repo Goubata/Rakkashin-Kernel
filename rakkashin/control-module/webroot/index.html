@@ -24,6 +24,8 @@
   button.mode b { display:block; font-size:16px; }
   button.mode span { color:var(--sub); font-size:13px; }
   button.mode.on { border-color:var(--acc); }
+  button.mode.extreme { grid-column:1 / -1; }
+  button.mode.extreme b { color:#e5484d; }
   .row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:6px 0; }
   .row + .row { border-top:1px solid var(--line); }
   input[type=number] { width:80px; font:inherit; color:var(--fg); background:var(--bg);
@@ -150,6 +152,7 @@ const T = {
     sc_saved: "スマートバランスの上限を変更しました",
     performance: ["パフォーマンス", "操作中は周波数下限30%・反応速め・スレッドブースト+15%"],
     game: ["ゲーム", "下限50%・前面アプリ優先・スレッドブースト+25%"],
+    extreme: ["極限", "CPU・メモリ・GPU を常に最高速。性能だけを優先し、発熱と電池消費が大きく増えます。ベンチマークなど本当に必要なときだけ"],
     pw_title: "消費電力",
     pw_desc: "電池から出ている電力です。プロファイルを切り替えて見比べられます。",
     pw_avg: (w) => `直近60秒の平均 ${w} W`,
@@ -200,6 +203,7 @@ const T = {
     sc_saved: "Smart Balanced cap changed",
     performance: ["Performance", "30% floor while you touch, faster response, thread boost +15%"],
     game: ["Game", "50% floor, foreground first, thread boost +25%"],
+    extreme: ["Extreme", "CPU, memory and GPU pinned at top speed. Performance only: much more heat and battery drain. For benchmarks and when you truly need it"],
     pw_title: "Power draw",
     pw_desc: "Power drawn from the battery. Switch profiles to compare.",
     pw_avg: (w) => `60 s average ${w} W`,
@@ -241,7 +245,7 @@ const FSYNC = "/sys/module/sync/parameters/fsync_enabled";
 const LB = "/sys/module/launch_boost/parameters/enabled";
 const TB = "/sys/module/rk_tboost/parameters/enabled";
 const WLB = "/sys/class/misc/boeffla_wakelock_blocker/wakelock_blocker";
-const MODES = ["battery", "balanced", "performance", "game"];
+const MODES = ["battery", "balanced", "performance", "game", "extreme"];
 
 // KernelSU WebUI bridge: ksu.exec(cmd, optionsJson, callbackName)
 function exec(cmd) {
@@ -259,7 +263,7 @@ function renderModes(current) {
   box.replaceChildren();
   for (const id of MODES) {
     const b = document.createElement("button");
-    b.className = "mode" + (id === current ? " on" : "");
+    b.className = "mode" + (id === "extreme" ? " extreme" : "") + (id === current ? " on" : "");
     const t = document.createElement("b"); t.textContent = T[id][0];
     const d = document.createElement("span"); d.textContent = T[id][1];
     b.append(t, d);
