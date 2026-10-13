@@ -29,12 +29,14 @@ by **Rakkashin**
   Works without the control module.
 - **Demand-matched frequency**: while the screen isn't touched, Battery and
   Smart Balanced cap each cluster at the frequency its busiest CPU actually
-  needs (measured utilization + 25%), re-evaluated every 100 ms. The vendor
-  governor can no longer overshoot, so the same work runs at lower
-  frequency and voltage; real load growth raises the cap within a few
-  hundred ms.
-- **Power limit**: keep battery drain under a set wattage (WebUI); the
-  kernel measures it every second and steps the CPU cap down or up.
+  needs (measured utilization + 25%), re-evaluated every 20 ms. Rises at
+  once, jumps by half when a CPU saturates at the cap (full speed within
+  ~60 ms), falls only after 100 ms of lower load. The vendor governor can no
+  longer overshoot, so the same work runs at lower frequency and voltage.
+- **Power limit**: keep battery drain under a set wattage (WebUI). CPU power
+  is predicted every 20 ms from the Energy Model and the cap set to fit the
+  budget left after non-CPU power, which a real battery reading calibrates
+  each second.
 - **Per-app profiles**: give any app its own profile; it applies while that app
   is in the foreground (decided in-kernel on cpuset attach, no polling).
 - **Thread boost**: the heaviest foreground threads get a uclamp floor of
@@ -78,6 +80,10 @@ Ported ideas from AGNi, NGK, Melt, LawRun and RealKing; original work for the pr
 per-app switching, thread boost, launch boost and efficiency caps.
 
 ## Install
+
+The AnyKernel3 zip ships arm64 `busybox`/`magiskboot` (from Magisk v30.7):
+this SoC can't run the 32-bit tools stock AnyKernel3 includes, which broke
+flashing with Kernel Flasher.
 
 1. Uninstall any older control module (`avr Profile Switcher`).
 2. Flash `Rakkashin-Kernel-*-avr-AnyKernel3.zip` from the KernelSU-Next app

@@ -63,7 +63,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.2 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.3 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -112,6 +112,8 @@ struct avr_policy_reqs {
 	bool added;
 	struct freq_qos_request min;
 	struct freq_qos_request max;
+	s32 dcap;		/* demand cap in kHz, 0 = start from measured need */
+	unsigned int low_ticks;	/* consecutive ticks the need sat well below dcap */
 };
 
 /* indexed by policy->cpu, the policy's owning CPU */
@@ -127,14 +129,18 @@ static bool smart_armed;			/* first touch seen: boot is over */
 static unsigned long last_kick;			/* jiffies of the last touch/launch */
 
 /* demand cap and power limit, re-evaluated by gov_work */
-#define GOV_MS			100
+#define GOV_MS			20
 #define DEMAND_HEADROOM_PCT	25	/* above measured utilization */
 #define DEMAND_FLOOR_PCT	30	/* never cap below this share of max */
-#define POWER_EVERY		10	/* measure power every POWER_EVERY ticks */
+#define DEMAND_FALL_TICKS	5	/* need must stay low this long before lowering */
+#define DEMAND_SAT_PCT		90	/* a CPU this busy at the cap is saturated */
+#define POWER_EVERY		50	/* measure battery power every POWER_EVERY ticks (1s) */
 #define POWER_MIN_PCT		30
 static unsigned int power_limit_mw;		/* 0 = off */
 static unsigned int power_pct = 100;		/* CPU cap from the power loop */
 static unsigned int power_now_mw;		/* last measurement */
+static unsigned int power_base_mw;		/* non-CPU power, from measurements */
+static bool power_discharging;			/* last measurement was on battery */
 
 static enum avr_mode cur_mode = AVR_BALANCED;	/* in effect */
 static enum avr_mode base_mode = AVR_BALANCED;	/* chosen by the user */
@@ -203,25 +209,57 @@ static s32 battery_cap(struct cpufreq_policy *policy, unsigned int pct,
 }
 
 /*
- * Frequency (kHz) this policy needs for its busiest CPU's current load plus
- * DEMAND_HEADROOM_PCT: utilization is frequency-invariant, so util/capacity
- * of max frequency does the work, with headroom to absorb growth until the
- * next evaluation. If the load grows, util rises at the capped frequency and
- * the cap follows by up to the headroom each GOV_MS.
+ * Demand cap, re-evaluated every GOV_MS while the screen isn't touched.
+ *
+ * need = frequency the busiest CPU of the policy needs for its current load
+ * (utilization is frequency-invariant, so util/capacity of max frequency)
+ * plus DEMAND_HEADROOM_PCT. The cap
+ *  - rises at once when need exceeds it,
+ *  - jumps by half when a CPU is saturated at the cap (its util is then
+ *    bounded by the cap itself, so need would under-read the real demand),
+ *  - falls only after need stayed below 85% of it for DEMAND_FALL_TICKS,
+ *    and then gradually, so short dips between frames don't cost speed.
+ * The vendor governor can't overshoot it, so the same work runs at lower
+ * frequency and voltage.
  */
-static s32 demand_khz(struct cpufreq_policy *policy)
+static void demand_update(struct cpufreq_policy *policy)
 {
+	struct avr_policy_reqs *r = &reqs[policy->cpu];
+	unsigned int fmax = policy->cpuinfo.max_freq;
+	s32 floor = pct_of(fmax, DEMAND_FLOOR_PCT);
+	s32 cur = r->dcap ? r->dcap : (s32)fmax;
 	unsigned long need = 0;
+	bool saturated = false;
 	unsigned int cpu;
+	s32 want;
 
 	for_each_cpu(cpu, policy->cpus) {
-		unsigned long cap = arch_scale_cpu_capacity(cpu);
+		unsigned long cap = max(arch_scale_cpu_capacity(cpu), 1UL);
 		unsigned long u = min(rk_cpu_util(cpu), cap);
 
-		need = max(need, u * policy->cpuinfo.max_freq / max(cap, 1UL));
+		need = max(need, u * fmax / cap);
+		/* capacity available at the cap: cap * dcap / fmax */
+		if (u * 100 >= DEMAND_SAT_PCT * (cap * (unsigned long)cur / fmax))
+			saturated = true;
 	}
-	return (s32)min_t(unsigned long, need * (100 + DEMAND_HEADROOM_PCT) / 100,
-			  policy->cpuinfo.max_freq);
+	want = clamp_t(s32, need * (100 + DEMAND_HEADROOM_PCT) / 100, floor, fmax);
+
+	if (!r->dcap) {			/* fresh start: take the need as is */
+		r->dcap = want;
+		r->low_ticks = 0;
+	} else if (saturated && r->dcap < (s32)fmax) {
+		r->dcap = min_t(s32, fmax, r->dcap + r->dcap / 2);
+		r->low_ticks = 0;
+	} else if (want > r->dcap) {
+		r->dcap = want;
+		r->low_ticks = 0;
+	} else if (want < r->dcap * 85 / 100) {
+		if (++r->low_ticks >= DEMAND_FALL_TICKS)
+			/* step down by at most 10% of max per tick */
+			r->dcap = max_t(s32, want, r->dcap - (s32)(fmax / 10));
+	} else {
+		r->low_ticks = 0;
+	}
 }
 
 /* Called with avr_lock held. */
@@ -244,8 +282,8 @@ static void apply_policy(struct cpufreq_policy *policy,
 		max = pct_of(fmax, m->max_pct);
 	if (m->smart && idle && smart_cap < 100)
 		max = min(max, pct_of(fmax, smart_cap));
-	if (m->demand && idle)
-		max = min(max, max(demand_khz(policy), pct_of(fmax, DEMAND_FLOOR_PCT)));
+	if (m->demand && idle && r->dcap)
+		max = min(max, r->dcap);
 	if (power_pct < 100)
 		max = min(max, pct_of(fmax, power_pct));
 	if (max >= (s32)fmax)
@@ -266,13 +304,12 @@ static void apply_policy(struct cpufreq_policy *policy,
 
 	freq_qos_update_request(&r->min, min);
 	/*
-	 * The demand cap is re-evaluated every GOV_MS; skip changes below ~3%
-	 * of max so load jitter doesn't churn cpufreq limit updates. Lifting
-	 * the cap entirely always goes through.
+	 * Caps are re-evaluated every GOV_MS: skip *lowering* them by less than
+	 * ~3% of max so load jitter doesn't churn cpufreq limit updates. Any
+	 * raise goes through at once, so performance is never held back.
 	 */
-	if (max != FREQ_QOS_MAX_DEFAULT_VALUE &&
-	    r->max.pnode.prio != FREQ_QOS_MAX_DEFAULT_VALUE &&
-	    abs(max - r->max.pnode.prio) < (s32)(fmax / 32))
+	if (max < r->max.pnode.prio &&
+	    r->max.pnode.prio - max < (s32)(fmax / 32))
 		return;
 	freq_qos_update_request(&r->max, max);
 }
@@ -388,32 +425,153 @@ static unsigned int battery_mw(void)
 	return mw;
 }
 
+/*
+ * Power model: predicted CPU power of a policy, in uW, if its CPUs ran at
+ * the highest OPP <= @khz (or at policy->cur when @khz is 0) with their
+ * current load. From the Energy Model: power(OPP) times the busy fraction,
+ * util / (capacity at that OPP), per CPU. Returns -1 without a usable EM.
+ */
+static s64 cpu_power_uw(struct cpufreq_policy *policy, unsigned int khz)
+{
+	struct em_perf_domain *pd = em_cpu_get(policy->cpu);
+	unsigned int fmax = policy->cpuinfo.max_freq;
+	struct em_perf_state *table;
+	unsigned long f, pw;
+	unsigned int cpu;
+	s64 total = 0;
+	int i, n;
+
+	if (!pd || em_is_artificial(pd) || !(pd->flags & EM_PERF_DOMAIN_MICROWATTS))
+		return -1;
+	if (!khz)
+		khz = READ_ONCE(policy->cur);
+
+	rcu_read_lock();
+	table = em_perf_state_from_pd(pd);
+	n = em_pd_nr_perf_states(pd);
+	f = table[0].frequency;
+	pw = table[0].power;
+	for (i = 1; i < n && table[i].frequency <= khz; i++) {
+		f = table[i].frequency;
+		pw = table[i].power;
+	}
+	rcu_read_unlock();
+
+	for_each_cpu(cpu, policy->cpus) {
+		unsigned long cap = max(arch_scale_cpu_capacity(cpu), 1UL);
+		unsigned long u = min(rk_cpu_util(cpu), cap);
+		/* busy share at f, in permille: util / (cap * f / fmax) */
+		unsigned long busy = min(1000UL, u * fmax * 1000 / (cap * max(f, 1UL)));
+
+		total += (s64)pw * busy / 1000;
+	}
+	return total;
+}
+
+/* Sum of cpu_power_uw() over all policies; -1 if any lacks a model. */
+static s64 cpus_power_uw(unsigned int pct)
+{
+	unsigned int cpu;
+	s64 total = 0;
+
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+		s64 p;
+
+		if (!policy)
+			continue;
+		p = policy->cpu != cpu ? 0 :
+		    cpu_power_uw(policy, pct ? pct_of(policy->cpuinfo.max_freq, pct) : 0);
+		cpufreq_cpu_put(policy);
+		if (p < 0)
+			return -1;
+		total += p;
+	}
+	return total;
+}
+
+/*
+ * Power limit, called every GOV_MS with avr_lock held. With an Energy Model
+ * it is predictive: budget = limit - non-CPU power (calibrated each second
+ * from a real battery reading), and the CPU cap is the highest 5% step whose
+ * predicted CPU power fits the budget, so a load spike is answered within
+ * one tick instead of after the next measurement. Without a usable EM it
+ * steps the cap from the 1s measurements alone.
+ */
+static void power_update(unsigned int limit, bool measured, unsigned int mw)
+{
+	s64 now_uw;
+	unsigned int pct;
+
+	if (!limit) {
+		power_pct = 100;
+		return;
+	}
+
+	if (measured) {
+		power_now_mw = mw;
+		power_discharging = mw;
+		now_uw = cpus_power_uw(0);
+		if (mw && now_uw >= 0) {
+			unsigned int base = mw > now_uw / 1000 ? mw - now_uw / 1000 : 0;
+
+			/* smooth, but follow a fresh calibration quickly */
+			power_base_mw = power_base_mw ? (power_base_mw + base) / 2 : base;
+		}
+	}
+	if (!power_discharging) {	/* charging or unknown: nothing to limit */
+		power_pct = 100;
+		return;
+	}
+
+	if (cpus_power_uw(100) < 0) {
+		/* no model: measured stepping */
+		if (!measured)
+			return;
+		if (mw > limit)
+			power_pct = max_t(int, POWER_MIN_PCT, (int)power_pct -
+					  (int)clamp_t(unsigned int, (mw - limit) * 50 / limit, 5, 20));
+		else if (mw < limit * 85 / 100)
+			power_pct = min(100U, power_pct + 5);
+		return;
+	}
+
+	for (pct = 100; pct > POWER_MIN_PCT; pct -= 5) {
+		s64 budget_uw = ((s64)limit - power_base_mw) * 1000;
+
+		if (cpus_power_uw(pct) <= budget_uw)
+			break;
+	}
+	/* drop at once, rise by at most 10% per tick to avoid see-sawing */
+	power_pct = pct < power_pct ? pct : min(pct, power_pct + 10);
+}
+
 static void gov_fn(struct work_struct *work)
 {
 	static unsigned int tick;
 	unsigned int limit = READ_ONCE(power_limit_mw);
-	unsigned int mw = 0;
-	bool measure = limit && ++tick % POWER_EVERY == 0;
+	unsigned int mw = 0, cpu;
+	bool measure = limit && ++tick % POWER_EVERY == 1;
 
 	/* outside avr_lock: the battery driver may talk to firmware */
 	if (measure)
 		mw = battery_mw();
 
 	mutex_lock(&avr_lock);
-	if (!limit) {
-		power_pct = 100;
-	} else if (measure) {
-		power_now_mw = mw;
-		if (!mw)
-			power_pct = 100;	/* charging or unknown: nothing to limit */
-		else if (mw > limit)
-			/* step down harder the further over we are */
-			power_pct = max_t(int, POWER_MIN_PCT, (int)power_pct -
-					  (int)clamp_t(unsigned int,
-						       (mw - limit) * 50 / limit, 5, 20));
-		else if (mw < limit * 85 / 100)
-			power_pct = min(100U, power_pct + 5);
+	for_each_possible_cpu(cpu) {
+		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+
+		if (!policy)
+			continue;
+		if (policy->cpu == cpu) {
+			if (modes[cur_mode].demand && smart_armed && !smart_lifted)
+				demand_update(policy);
+			else
+				reqs[cpu].dcap = 0;	/* re-measure when capping resumes */
+		}
+		cpufreq_cpu_put(policy);
 	}
+	power_update(limit, measure, mw);
 	apply_policies(&modes[cur_mode]);
 	if (gov_needed())
 		gov_kick();
@@ -429,7 +587,12 @@ static void smart_lift_fn(struct work_struct *work)
 {
 	mutex_lock(&avr_lock);
 	if (smart_active && !smart_lifted) {
+		unsigned int cpu;
+
 		smart_lifted = true;
+		/* demand caps start over from the load seen after the touch */
+		for_each_possible_cpu(cpu)
+			reqs[cpu].dcap = 0;
 		apply_policies(&modes[cur_mode]);
 	}
 	mutex_unlock(&avr_lock);
