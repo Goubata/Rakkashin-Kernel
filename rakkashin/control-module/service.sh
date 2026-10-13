@@ -33,6 +33,14 @@ if [ "$(cat "$STATE/zram2" 2>/dev/null)" != 0 ]; then
 	sh "$MODDIR/zram.sh" setup && sh "$MODDIR/zram.sh" loop &
 fi
 
+# GPU demand governor (default on; "0" in $STATE/gpu disables it). Needs a
+# kernel with demand_active and the kgsl /sys/kernel/gpu interface.
+if [ "$(cat "$STATE/gpu" 2>/dev/null)" != 0 ] && [ -e "$K/demand_active" ] &&
+   [ -w /sys/kernel/gpu/gpu_max_clock ]; then
+	chmod 755 "$MODDIR/bin/rk_gpud"
+	"$MODDIR/bin/rk_gpud" </dev/null >/dev/null 2>&1 &
+fi
+
 # The kernel sysfs_notify()s "mode" on every switch; inotifyd blocks until
 # then, so this costs nothing while idle.
 active() { sed -n 's/.*\[\([a-z]*\)\].*/\1/p' "$K/mode"; }

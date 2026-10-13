@@ -100,6 +100,10 @@
     <div><b data-i18n="tb_title"></b><div class="sub" data-i18n="tb_desc"></div></div>
     <input type="checkbox" id="tb">
   </div>
+  <div class="row" id="gpurow">
+    <div><b data-i18n="gpu_title"></b><div class="sub" data-i18n="gpu_desc"></div></div>
+    <input type="checkbox" id="gpu">
+  </div>
   <div class="row">
     <div><b data-i18n="io_title"></b><div class="sub" data-i18n="io_desc"></div></div>
     <input type="checkbox" id="adios">
@@ -157,6 +161,10 @@ const T = {
     pw_desc: "電池から出ている電力です。プロファイルを切り替えて見比べられます。",
     pw_avg: (w) => `直近60秒の平均 ${w} W`,
     pw_charging: "充電中",
+    gpu_title: "GPU 効率化",
+    gpu_desc: "バッテリーとスマートバランスで、画面に触れていない間、GPU を今の描画に必要な周波数までに抑えます。触れるとすぐ解除されます。",
+    gpu_on: "GPU 効率化をオンにしました",
+    gpu_off: "GPU 効率化をオフにしました",
     io_title: "ADIOS I/O スケジューラ",
     io_desc: "ストレージの読み書きの順番を賢く決めて、アプリの起動や読み込みの待ち時間を短くします。",
     io_on: "ADIOS に切り替えました",
@@ -208,6 +216,10 @@ const T = {
     pw_desc: "Power drawn from the battery. Switch profiles to compare.",
     pw_avg: (w) => `60 s average ${w} W`,
     pw_charging: "Charging",
+    gpu_title: "GPU efficiency",
+    gpu_desc: "In Battery and Smart Balanced, while the screen isn't touched, holds the GPU to the frequency the current frames need. Lifted the instant you touch.",
+    gpu_on: "GPU efficiency on",
+    gpu_off: "GPU efficiency off",
     io_title: "ADIOS I/O scheduler",
     io_desc: "Orders storage reads and writes smartly to cut wait times when apps start or load.",
     io_on: "Switched to ADIOS",
@@ -431,6 +443,20 @@ async function init() {
   bindToggle("fsync", FSYNC, "fsync");
   bindToggle("lb", LB, "launch_boost");
   bindToggle("tb", TB, "tboost");
+  const gpu = document.getElementById("gpu");
+  const gpuOk = (await exec(`[ -e ${NODE}/demand_active ] && [ -w /sys/kernel/gpu/gpu_max_clock ]`)).errno === 0;
+  if (!gpuOk) {
+    document.getElementById("gpurow").style.display = "none";
+  } else {
+    gpu.checked = (await exec(`cat ${STATE}/gpu 2>/dev/null`)).stdout.trim() !== "0";
+    gpu.onchange = async () => {
+      const on = gpu.checked;
+      const start = `chmod 755 ${MODDIR}/bin/rk_gpud; setsid ${MODDIR}/bin/rk_gpud </dev/null >/dev/null 2>&1 &`;
+      // stopping sends SIGTERM, which makes rk_gpud restore the GPU max clock
+      await exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/gpu; pkill -f ${MODDIR}/bin/rk_gpud; ${on ? start : "true"}`);
+      status(on ? T.gpu_on : T.gpu_off);
+    };
+  }
   const io = document.getElementById("adios");
   io.checked = (await exec(`cat ${STATE}/adios 2>/dev/null`)).stdout.trim() !== "0";
   io.onchange = async () => {

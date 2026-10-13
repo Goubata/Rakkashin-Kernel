@@ -64,7 +64,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.4 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.5 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -333,11 +333,32 @@ static void apply_policy(struct cpufreq_policy *policy,
 static void gov_fn(struct work_struct *work);
 static DECLARE_DEFERRABLE_WORK(gov_work, gov_fn);
 
+/* the demand-matched cap is live: a demand mode, booted, screen not touched */
+static bool demand_live(void)
+{
+	return modes[cur_mode].demand && smart_armed && !smart_lifted;
+}
+
+/*
+ * Tell userspace (the control module's GPU governor) when demand_live()
+ * flips, so it can lift or restore its own caps at once. Called with
+ * avr_lock held after any state change.
+ */
+static void demand_notify(void)
+{
+	static bool last;
+	bool now = demand_live();
+
+	if (now != last && avr_kobj) {
+		last = now;
+		sysfs_notify(avr_kobj, NULL, "demand_active");
+	}
+}
+
 /* the loop is needed while a demand cap is live or a power limit is set */
 static bool gov_needed(void)
 {
-	return (modes[cur_mode].demand && smart_armed && !smart_lifted) ||
-	       READ_ONCE(power_limit_mw);
+	return demand_live() || READ_ONCE(power_limit_mw);
 }
 
 static void gov_kick(void)
@@ -359,6 +380,7 @@ static void apply_policies(const struct avr_mode_params *m)
 			apply_policy(policy, m);
 		cpufreq_cpu_put(policy);
 	}
+	demand_notify();
 }
 
 /* Called with avr_lock held. */
@@ -580,7 +602,7 @@ static void gov_fn(struct work_struct *work)
 		if (!policy)
 			continue;
 		if (policy->cpu == cpu) {
-			if (modes[cur_mode].demand && smart_armed && !smart_lifted)
+			if (demand_live())
 				demand_update(policy);
 			else
 				reqs[cpu].dcap = 0;	/* re-measure when capping resumes */
@@ -913,6 +935,20 @@ static ssize_t smart_cap_store(struct kobject *kobj, struct kobj_attribute *attr
 
 static struct kobj_attribute smart_cap_attr = __ATTR_RW(smart_cap);
 
+/* 1 while the demand-matched cap is live; pollable (sysfs_notify on change) */
+static ssize_t demand_active_show(struct kobject *kobj,
+				  struct kobj_attribute *attr, char *buf)
+{
+	bool live;
+
+	mutex_lock(&avr_lock);
+	live = demand_live();
+	mutex_unlock(&avr_lock);
+	return sysfs_emit(buf, "%d\n", live);
+}
+
+static struct kobj_attribute demand_active_attr = __ATTR_RO(demand_active);
+
 /* "limit=<mW> now=<mW> cpu_cap=<%>"; write a limit in mW, 0 = off */
 static ssize_t power_limit_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -1067,6 +1103,7 @@ static struct attribute *avr_profile_attrs[] = {
 	&status_attr.attr,
 	&battery_caps_attr.attr,
 	&smart_cap_attr.attr,
+	&demand_active_attr.attr,
 	&power_limit_attr.attr,
 	NULL
 };

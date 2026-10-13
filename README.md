@@ -39,6 +39,12 @@ by **Rakkashin**
   once, jumps by half when a CPU saturates at the cap (full speed within
   ~60 ms), falls only after 100 ms of lower load. The vendor governor can no
   longer overshoot, so the same work runs at lower frequency and voltage.
+- **GPU efficiency**: the same idea for the GPU. `rk_gpud` (control module,
+  `rakkashin/control-module/src/rk_gpud.c`) caps the GPU at the lowest kgsl
+  frequency step that covers its measured load + 25% while the demand cap is
+  live, rising at once and jumping halfway to the top when saturated. It
+  sleeps in poll() on `/sys/kernel/avr_profile/demand_active` (sysfs_notify)
+  while inactive, so a touch lifts the GPU cap instantly.
 - **Power limit**: keep battery drain under a set wattage (WebUI). CPU power
   is predicted every 20 ms from the Energy Model and the cap set to fit the
   budget left after non-CPU power, which a real battery reading calibrates
