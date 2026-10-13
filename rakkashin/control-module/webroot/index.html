@@ -79,6 +79,10 @@
       <option value="90">90%</option><option value="100">OFF</option>
     </select>
   </div>
+  <div class="row" id="susrow">
+    <div><b data-i18n="sus_title"></b><div class="sub" data-i18n="sus_desc"></div></div>
+    <input type="checkbox" id="sustained">
+  </div>
 </div>
 
 <div class="card">
@@ -151,6 +155,10 @@ const T = {
     pl_saved: "パワーリミットを保存しました",
     caps: "バッテリーモードの上限周波数",
     balanced: ["スマートバランス", "操作中は全開・それ以外は必要な周波数だけ（初期値）"],
+    sus_title: "持続パフォーマンス",
+    sus_desc: "バッテリーとスマートバランスで、画面に触れている間も CPU と GPU を必要な分だけ（余裕40%）に抑えます。発熱を抑えて、長時間のゲームでもフレームレートが落ちにくくなります。",
+    sus_on: "持続パフォーマンスをオンにしました",
+    sus_off: "持続パフォーマンスをオフにしました",
     sc_title: "スマートバランスの上限",
     sc_desc: "画面に触れていない間の CPU 上限です。触れた瞬間に解除され、最後に触れてから1秒で戻ります。OFF にすると上限をかけません。",
     sc_saved: "スマートバランスの上限を変更しました",
@@ -206,6 +214,10 @@ const T = {
     pl_saved: "Power limit saved",
     caps: "Battery mode frequency caps",
     balanced: ["Smart Balanced", "Full speed while you touch, just the frequency needed otherwise (default)"],
+    sus_title: "Sustained performance",
+    sus_desc: "In Battery and Smart Balanced, keeps CPU and GPU at just what's needed (40% headroom) even while you touch the screen. Runs cooler, so frame rates hold up in long gaming sessions.",
+    sus_on: "Sustained performance on",
+    sus_off: "Sustained performance off",
     sc_title: "Smart Balanced cap",
     sc_desc: "CPU cap while the screen isn't being touched. Lifted the instant you touch, restored 1 s after the last touch. OFF disables the cap.",
     sc_saved: "Smart Balanced cap changed",
@@ -421,6 +433,18 @@ async function init() {
     }, 2000);
   } else {
     document.getElementById("plcard").style.display = "none";
+  }
+  const sus = document.getElementById("sustained");
+  const susv = await exec(`cat ${NODE}/sustained`);
+  if (susv.errno === 0) {
+    sus.checked = susv.stdout.trim() === "1";
+    sus.onchange = async () => {
+      const v = sus.checked ? 1 : 0;
+      await exec(`echo ${v} > ${NODE}/sustained && mkdir -p ${STATE} && echo ${v} > ${STATE}/sustained`);
+      status(sus.checked ? T.sus_on : T.sus_off);
+    };
+  } else {
+    document.getElementById("susrow").style.display = "none";
   }
   const sc = document.getElementById("smartcap");
   const scv = await exec(`cat ${NODE}/smart_cap`);

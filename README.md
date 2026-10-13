@@ -39,6 +39,11 @@ by **Rakkashin**
   once, jumps by half when a CPU saturates at the cap (full speed within
   ~60 ms), falls only after 100 ms of lower load. The vendor governor can no
   longer overshoot, so the same work runs at lower frequency and voltage.
+- **Sustained performance** (WebUI toggle, off by default): the demand-matched
+  CPU and GPU caps stay on while the screen is touched too, with 40%
+  headroom (a touch still lifts everything for one 20 ms tick). Runs cooler,
+  so long gaming sessions throttle less. Combine with per-app profiles to
+  use it for chosen games only.
 - **GPU efficiency**: the same idea for the GPU. `rk_gpud` (control module,
   `rakkashin/control-module/src/rk_gpud.c`) caps the GPU at the lowest kgsl
   frequency step that covers its measured load + 25% while the demand cap is

@@ -39,6 +39,11 @@
  * passive use (reading, video, background work) without touching interactive
  * performance. smart_cap=100 restores plain balanced.
  *
+ * Sustained performance (sustained=1): the demand-matched cap stays on while
+ * the screen is touched as well, with DEMAND_TOUCH_HEADROOM_PCT headroom; a
+ * touch still lifts everything for one loop tick so input response is
+ * unchanged. The fixed smart_cap is still lifted on touch.
+ *
  * CPU frequency is steered only through cpufreq's frequency QoS, the same
  * mechanism thermal mitigation uses. QoS takes the lowest max request and
  * the highest min request, and the policy max always wins over min, so a
@@ -64,7 +69,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.5 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.6 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -132,6 +137,12 @@ static bool applied;				/* a mode was applied at least once */
 /* Smart Balanced state */
 #define SMART_HOLD_MS	1000
 static unsigned int smart_cap = 80;		/* % of max while idle; 100 = off */
+/*
+ * Sustained performance: keep the demand-matched caps (CPU here, GPU in
+ * rk_gpud via demand_active) while the screen is touched too, with more
+ * headroom, so long gaming sessions run cooler and throttle less.
+ */
+static bool sustained;
 static bool smart_active;			/* the mode in effect uses it */
 static bool smart_lifted;			/* cap currently lifted */
 static bool smart_armed;			/* first touch seen: boot is over */
@@ -140,6 +151,7 @@ static unsigned long last_kick;			/* jiffies of the last touch/launch */
 /* demand cap and power limit, re-evaluated by gov_work */
 #define GOV_MS			20
 #define DEMAND_HEADROOM_PCT	25	/* above measured utilization */
+#define DEMAND_TOUCH_HEADROOM_PCT 40	/* while touched, with sustained on */
 #define DEMAND_FLOOR_PCT	30	/* never cap below this share of max */
 #define DEMAND_FALL_TICKS	5	/* need must stay low this long before lowering */
 #define DEMAND_SAT_PCT		90	/* a CPU this busy at the cap is saturated */
@@ -252,7 +264,8 @@ static void demand_update(struct cpufreq_policy *policy)
 		if (u * 100 >= DEMAND_SAT_PCT * (cap * (unsigned long)cur / fmax))
 			saturated = true;
 	}
-	want = clamp_t(s32, need * (100 + DEMAND_HEADROOM_PCT) / 100, floor, fmax);
+	want = clamp_t(s32, need * (100 + (smart_lifted ? DEMAND_TOUCH_HEADROOM_PCT :
+					    DEMAND_HEADROOM_PCT)) / 100, floor, fmax);
 
 	if (!r->dcap) {			/* fresh start: take the need as is */
 		r->dcap = want;
@@ -279,6 +292,8 @@ static void apply_policy(struct cpufreq_policy *policy,
 	struct avr_policy_reqs *r = &reqs[policy->cpu];
 	unsigned int fmax = policy->cpuinfo.max_freq;
 	bool idle = smart_armed && !smart_lifted;	/* no touch right now */
+	/* demand cap live: untouched, or touched with sustained performance */
+	bool demand_on = smart_armed && (!smart_lifted || sustained);
 	s32 min = FREQ_QOS_MIN_DEFAULT_VALUE;
 	s32 max = fmax;
 	bool from_em;
@@ -292,7 +307,7 @@ static void apply_policy(struct cpufreq_policy *policy,
 		max = pct_of(fmax, m->max_pct);
 	if (m->smart && idle && smart_cap < 100)
 		max = min(max, pct_of(fmax, smart_cap));
-	if (m->demand && idle && r->dcap)
+	if (m->demand && demand_on && r->dcap)
 		max = min(max, r->dcap);
 	if (power_pct < 100)
 		max = min(max, pct_of(fmax, power_pct));
@@ -336,7 +351,8 @@ static DECLARE_DEFERRABLE_WORK(gov_work, gov_fn);
 /* the demand-matched cap is live: a demand mode, booted, screen not touched */
 static bool demand_live(void)
 {
-	return modes[cur_mode].demand && smart_armed && !smart_lifted;
+	return modes[cur_mode].demand && smart_armed &&
+	       (!smart_lifted || sustained);
 }
 
 /*
@@ -632,6 +648,9 @@ static void smart_lift_fn(struct work_struct *work)
 		for_each_possible_cpu(cpu)
 			reqs[cpu].dcap = 0;
 		apply_policies(&modes[cur_mode]);
+		/* with sustained performance the loop keeps running while touched */
+		if (gov_needed())
+			gov_kick();
 	}
 	mutex_unlock(&avr_lock);
 	mod_delayed_work(system_unbound_wq, &smart_drop_work,
@@ -949,6 +968,31 @@ static ssize_t demand_active_show(struct kobject *kobj,
 
 static struct kobj_attribute demand_active_attr = __ATTR_RO(demand_active);
 
+static ssize_t sustained_show(struct kobject *kobj, struct kobj_attribute *attr,
+			      char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(sustained));
+}
+
+static ssize_t sustained_store(struct kobject *kobj, struct kobj_attribute *attr,
+			       const char *buf, size_t count)
+{
+	bool on;
+
+	if (kstrtobool(buf, &on))
+		return -EINVAL;
+
+	mutex_lock(&avr_lock);
+	WRITE_ONCE(sustained, on);
+	apply_policies(&modes[cur_mode]);	/* also notifies demand_active */
+	if (gov_needed())
+		gov_kick();
+	mutex_unlock(&avr_lock);
+	return count;
+}
+
+static struct kobj_attribute sustained_attr = __ATTR_RW(sustained);
+
 /* "limit=<mW> now=<mW> cpu_cap=<%>"; write a limit in mW, 0 = off */
 static ssize_t power_limit_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -1104,6 +1148,7 @@ static struct attribute *avr_profile_attrs[] = {
 	&battery_caps_attr.attr,
 	&smart_cap_attr.attr,
 	&demand_active_attr.attr,
+	&sustained_attr.attr,
 	&power_limit_attr.attr,
 	NULL
 };
