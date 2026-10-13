@@ -111,6 +111,14 @@ flashing with Kernel Flasher.
 
 Keep your stock `boot.img` to roll back with fastboot.
 
+## Diagnostics
+
+`rk_diag.sh` (in the control module, `/data/adb/modules/rakkashin/rk_diag.sh`)
+collects the kernel/module state and samples CPU and GPU caps for 10 s into
+`/sdcard/RakkashinKernel/diag.txt`. Run it from Termux with root, leave the
+screen untouched while it samples. Module scripts also log to
+`/data/adb/rakkashin/rakkashin.log`.
+
 ## Build
 
 ```sh

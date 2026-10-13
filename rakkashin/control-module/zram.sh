@@ -12,7 +12,14 @@ Z=/sys/block/zram0
 DEV=/dev/block/zram0
 PERIOD=1800
 
-log() { echo "rakkashin-zram: $*" > /dev/kmsg; }
+# log to dmesg and to a file that survives the kernel ring buffer wrapping
+log() {
+	echo "rakkashin-zram: $*" > /dev/kmsg
+	mkdir -p /data/adb/rakkashin
+	f=/data/adb/rakkashin/rakkashin.log
+	[ -f "$f" ] && [ "$(wc -c < "$f")" -gt 65536 ] && mv -f "$f" "$f.old"
+	echo "$(date '+%m-%d %H:%M:%S') zram: $*" >> "$f"
+}
 
 # swapon, logging the error; retry without a priority if that is rejected
 swap_on() {

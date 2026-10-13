@@ -23,7 +23,12 @@ until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 2; done
 [ "$(cat "$STATE/lmk" 2>/dev/null)" != 0 ] && sh "$MODDIR/lmk.sh" apply
 
 # ADIOS I/O scheduler on UFS (default on; "0" in $STATE/adios disables it)
-[ "$(cat "$STATE/adios" 2>/dev/null)" != 0 ] && sh "$MODDIR/io.sh" apply
+if [ "$(cat "$STATE/adios" 2>/dev/null)" != 0 ]; then
+	sh "$MODDIR/io.sh" apply
+	# vendor init can still reset the schedulers after boot_completed:
+	# apply once more a minute later
+	(sleep 60; [ "$(cat "$STATE/adios" 2>/dev/null)" != 0 ] && sh "$MODDIR/io.sh" apply) &
+fi
 
 # f2fs: let fsync of files with up to 20 dirty blocks take the fast
 # roll-forward path instead of a full checkpoint (stock: 8)

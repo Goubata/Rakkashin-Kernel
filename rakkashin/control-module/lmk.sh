@@ -20,7 +20,14 @@ ro.lmk.psi_complete_stall_ms 1000
 "
 CACHED=64
 
-log() { echo "rakkashin-lmk: $*" > /dev/kmsg; }
+# log to dmesg and to a file that survives the kernel ring buffer wrapping
+log() {
+	echo "rakkashin-lmk: $*" > /dev/kmsg
+	mkdir -p /data/adb/rakkashin
+	f=/data/adb/rakkashin/rakkashin.log
+	[ -f "$f" ] && [ "$(wc -c < "$f")" -gt 65536 ] && mv -f "$f" "$f.old"
+	echo "$(date '+%m-%d %H:%M:%S') lmk: $*" >> "$f"
+}
 
 apply() {
 	if [ ! -x "$RP" ] && ! command -v resetprop >/dev/null; then
