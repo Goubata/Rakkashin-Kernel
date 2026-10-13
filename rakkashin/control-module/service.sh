@@ -38,6 +38,9 @@ fi
 if [ "$(cat "$STATE/gpu" 2>/dev/null)" != 0 ] && [ -e "$K/demand_active" ] &&
    [ -w /sys/kernel/gpu/gpu_max_clock ]; then
 	chmod 755 "$MODDIR/bin/rk_gpud"
+	# the saved original max only guards restarts within one boot; record
+	# afresh each boot so changes to the GPU max (e.g. an underclock) count
+	rm -f "$STATE/gpu_orig_max"
 	"$MODDIR/bin/rk_gpud" </dev/null >/dev/null 2>&1 &
 fi
 

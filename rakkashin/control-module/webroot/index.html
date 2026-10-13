@@ -453,7 +453,9 @@ async function init() {
       const on = gpu.checked;
       const start = `chmod 755 ${MODDIR}/bin/rk_gpud; setsid ${MODDIR}/bin/rk_gpud </dev/null >/dev/null 2>&1 &`;
       // stopping sends SIGTERM, which makes rk_gpud restore the GPU max clock
-      await exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/gpu; pkill -f ${MODDIR}/bin/rk_gpud; ${on ? start : "true"}`);
+      // rk_gpud restores the max clock on SIGTERM; dropping its saved
+      // original makes the next start record the current max afresh
+      await exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/gpu; pkill -f ${MODDIR}/bin/rk_gpud; sleep 0.2; rm -f ${STATE}/gpu_orig_max; ${on ? start : "true"}`);
       status(on ? T.gpu_on : T.gpu_off);
     };
   }
