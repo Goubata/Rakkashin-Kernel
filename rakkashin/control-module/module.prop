@@ -1,6 +1,6 @@
 id=rakkashin
 name=Rakkashin Kernel Control
-version=v2.9.1
-versionCode=32
+version=v3.0
+versionCode=33
 author=Rakkashin
 description=Control panel for Rakkashin Kernel: Smart Balanced with demand-matched CPU and GPU frequency, thermal-aware sustained performance, Extreme mode, power limit, global and per-app profiles, power meter, thread and launch boost, ADIOS I/O, keep-more-apps, lz4/zstd zram, wakelock blocker, fsync. Requires Rakkashin Kernel.

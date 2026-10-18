@@ -100,7 +100,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.9 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.0 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);

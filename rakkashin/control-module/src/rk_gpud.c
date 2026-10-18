@@ -40,9 +40,12 @@
  *    (touch with Sustained off or cool, Performance/Game/Extreme) and on
  *    exit.
  *
- * Frame timing (needs /dev/encore_fas from the kernel): the
- * foreground app (/sys/kernel/avr_profile/top_pid) is registered with
- * encore_fas, which times its Surface::queueBuffer calls. A late frame,
+ * Frame timing (needs /dev/encore_fas from the kernel): every app process
+ * in top-app (up to MAX_LISTENERS, rescanned when top_pid changes and every
+ * RESCAN_MS) is registered with encore_fas, which times its
+ * Surface::queueBuffer calls. top-app also holds processes that never draw
+ * (a game's bound ad service, a shell child), so the one whose frames
+ * arrive becomes the watched app; the others stay silent. A late frame,
  * an overdue frame or a frame rate deficit while the GPU ran at its cap
  * lifts the cap at once (to the top for a bad one) and learns a floor; a
  * jank that the cap didn't cause changes nothing. While frames fall short
@@ -136,6 +139,9 @@
 
 /* frame timing */
 #define REG_DELAY_MS	500	/* let a foreground switch settle before probing */
+#define RESCAN_MS	5000	/* look at top-app this often anyway */
+#define MAX_LISTENERS	8
+#define PRIMARY_IDLE_MS	1000	/* another app's frames take over after this */
 #define JANK_BOUND_PCT	90	/* the GPU ran this close to the cap: it held the frame */
 #define FAS_STATE_MS	2000	/* write fas_state at most this often */
 #define FAS_TOUCH_HEADROOM_MIN 30	/* touched floor of the trim, see TOUCH_HEADROOM_MIN */
@@ -191,10 +197,11 @@ static long mem_uid = -1;	/* UID whose state is live */
 static struct {
 	int fd;			/* /dev/encore_fas, -1 = off */
 	uint64_t offset;	/* Surface::queueBuffer in LIBGUI */
-	int ctx;		/* our listener, -1 = none */
-	int pid;		/* registered process */
-	int want_pid;		/* top_pid, to register at reg_at */
-	long reg_at;		/* ms, 0 = nothing pending */
+	int ctx;		/* listener of the app whose frames we follow, -1 = none */
+	int pid;		/* its process */
+	long last_ev;		/* ms of its last event */
+	long reg_at;		/* ms of the next top-app scan, 0 = none pending */
+	long synced_at;		/* ms of the last scan */
 	int degraded;		/* frame rate below its target right now */
 	int paused;		/* the app stopped drawing (loading, background) */
 	unsigned int fps;	/* target frame rate the detector settled on */
@@ -206,6 +213,13 @@ static struct {
 	long state_at;		/* ms of the last fas_state write */
 	int state_dirty;
 } fas = { .fd = -1, .ctx = -1 };
+
+/* every app process in top-app is registered; see the top */
+static struct {
+	int pid, ctx;
+	long uid;
+} lis[MAX_LISTENERS];
+static int nlis;
 
 /* to dmesg and to the module log, which survives the ring buffer wrapping */
 static void klog(const char *msg)
@@ -747,18 +761,32 @@ static void fas_write_state(long t)
 	fas.state_dirty = fas.ctx >= 0;
 }
 
-static void fas_unregister(void)
+/* stop following an app (its listener may stay registered) */
+static void fas_forget_primary(void)
 {
-	if (fas.ctx >= 0) {
-		struct fas_remove_args r = { .ctx_id = fas.ctx };
-
-		ioctl(fas.fd, FAS_IOC_REMOVE, &r);
-		fas.ctx = -1;
-	}
+	fas.ctx = -1;
+	fas.pid = 0;
 	fas.degraded = 0;
 	fas.paused = 0;
 	fas.fps = 0;
 	fas.state_dirty = 1;
+}
+
+static void fas_drop(int i)
+{
+	struct fas_remove_args r = { .ctx_id = lis[i].ctx };
+
+	ioctl(fas.fd, FAS_IOC_REMOVE, &r);
+	if (lis[i].ctx == fas.ctx)
+		fas_forget_primary();
+	lis[i] = lis[--nlis];
+}
+
+static void fas_unregister(void)
+{
+	while (nlis)
+		fas_drop(nlis - 1);
+	fas_forget_primary();
 }
 
 /*
@@ -767,18 +795,6 @@ static void fas_unregister(void)
  * by 12% at least.
  */
 static const unsigned int fas_rates[] = { 144, 120, 90, 72, 60, 45, 40, 30 };
-
-/* UID of a process, -1 if gone */
-static long pid_uid(int pid)
-{
-	char path[64], st[512], *u;
-
-	snprintf(path, sizeof(path), "/proc/%d/status", pid);
-	if (pid <= 0 || read_text(path, st, sizeof(st)))
-		return -1;
-	u = strstr(st, "\nUid:");
-	return u ? atol(u + 5) : -1;
-}
 
 /* the app in front changed: keep what was learned, restore what we know */
 static void app_mem_switch(long uid)
@@ -840,16 +856,11 @@ static const char *app_name(int pid)
 	return name;
 }
 
-static void fas_register(int pid)
+static void fas_add(int pid, long uid)
 {
 	struct fas_register_args a;
 	unsigned int i;
 	char msg[128];
-
-	fas_unregister();
-	app_mem_switch(pid_uid(pid));
-	if (pid <= 0)
-		return;
 
 	memset(&a, 0, sizeof(a));
 	a.pid = pid;
@@ -867,13 +878,81 @@ static void fas_register(int pid)
 		}
 		return;
 	}
-	fas.ctx = a.ctx_id;
-	fas.pid = pid;
+	lis[nlis].pid = pid;
+	lis[nlis].ctx = a.ctx_id;
+	lis[nlis].uid = uid;
+	nlis++;
+}
+
+/* app processes in top-app: regular app UIDs, named like a package */
+static int top_app_procs(int *pids, long *uids, int max)
+{
+	char buf[4096], path[64], st[512], *p, *save = NULL;
+	int n = 0;
+
+	if (read_text("/dev/cpuset/top-app/cgroup.procs", buf, sizeof(buf)))
+		return 0;
+	for (p = strtok_r(buf, "\n", &save); p && n < max; p = strtok_r(NULL, "\n", &save)) {
+		int pid = atoi(p);
+		long uid;
+		char *u;
+
+		snprintf(path, sizeof(path), "/proc/%d/status", pid);
+		if (pid <= 0 || read_text(path, st, sizeof(st)))
+			continue;
+		u = strstr(st, "\nUid:");
+		if (!u)
+			continue;
+		uid = atol(u + 5);
+		/* not a system, isolated or sandbox process */
+		if (uid % 100000 < 10000 || uid % 100000 > 19999)
+			continue;
+		/* an app process is named after its package; a shell child isn't */
+		if (app_name(pid)[0] == '/' || app_name(pid)[0] == '?')
+			continue;
+		pids[n] = pid;
+		uids[n] = uid;
+		n++;
+	}
+	return n;
+}
+
+/* bring the listeners in line with what top-app holds now */
+static void fas_sync(long t)
+{
+	int pids[MAX_LISTENERS], n, i, j;
+	long uids[MAX_LISTENERS];
+
+	fas.synced_at = t;
+	n = top_app_procs(pids, uids, MAX_LISTENERS);
+	for (i = nlis - 1; i >= 0; i--) {
+		for (j = 0; j < n && pids[j] != lis[i].pid; j++)
+			;
+		if (j == n)
+			fas_drop(i);
+	}
+	for (j = 0; j < n && nlis < MAX_LISTENERS; j++) {
+		for (i = 0; i < nlis && lis[i].pid != pids[j]; i++)
+			;
+		if (i == nlis)
+			fas_add(pids[j], uids[j]);
+	}
+}
+
+/* frames arrive from listener i: follow that app from now on */
+static void fas_follow(int i, long t)
+{
+	char msg[128];
+
+	fas_forget_primary();
+	fas.ctx = lis[i].ctx;
+	fas.pid = lis[i].pid;
 	fas.app_late = 0;
 	fas.app_events = 0;
-	fas.state_dirty = 1;
-	fas.last_jank = now_ms();	/* no probing until it proves healthy */
-	snprintf(msg, sizeof(msg), "watching frames of %.48s (pid %d)", app_name(pid), pid);
+	fas.last_jank = t;	/* no probing until it proves healthy */
+	app_mem_switch(lis[i].uid);
+	snprintf(msg, sizeof(msg), "watching frames of %.48s (pid %d)",
+		 app_name(lis[i].pid), lis[i].pid);
 	klog(msg);
 }
 
@@ -889,8 +968,17 @@ static void fas_events(long t)
 	for (i = 0; i < (int)(n / (ssize_t)sizeof(ev[0])); i++) {
 		int level = 0;
 
-		if (fas.ctx < 0 || ev[i].ctx_id != fas.ctx)
-			continue;
+		if (ev[i].ctx_id != fas.ctx) {
+			int k;
+
+			for (k = 0; k < nlis && lis[k].ctx != ev[i].ctx_id; k++)
+				;
+			/* not ours, or another app draws while ours still does */
+			if (k == nlis || (fas.ctx >= 0 && t - fas.last_ev < PRIMARY_IDLE_MS))
+				continue;
+			fas_follow(k, t);
+		}
+		fas.last_ev = t;
 		fas.app_events++;
 		if (ev[i].fps)		/* every event carries the active target */
 			fas.fps = ev[i].fps;
@@ -933,31 +1021,6 @@ static void fas_events(long t)
 	}
 	if (worst)
 		gov_jank(worst, t);
-}
-
-/* a top_pid of 0 at start: find the foreground app the slow way */
-static int top_app_pid(void)
-{
-	char buf[4096], path[64], st[512], *p;
-	int best = 0;
-
-	if (read_text("/dev/cpuset/top-app/cgroup.procs", buf, sizeof(buf)))
-		return 0;
-	for (p = strtok(buf, "\n"); p; p = strtok(NULL, "\n")) {
-		int pid = atoi(p);
-		char *u;
-
-		snprintf(path, sizeof(path), "/proc/%d/status", pid);
-		if (pid <= 0 || read_text(path, st, sizeof(st)))
-			continue;
-		u = strstr(st, "\nUid:");
-		/* a regular app, not a system, isolated or sandbox process */
-		if (u && atol(u + 5) % 100000 >= 10000 && atol(u + 5) % 100000 <= 19999) {
-			best = pid;
-			break;
-		}
-	}
-	return best;
 }
 
 static void fas_init(void)
@@ -1050,9 +1113,6 @@ int main(int argc, char **argv)
 		else
 			klog("kernel has no top_pid, frame timing off");
 		if (fas.fd >= 0) {
-			long pid = read_fd_long(tfd);
-
-			fas.want_pid = pid > 0 ? (int)pid : top_app_pid();
 			fas.reg_at = now_ms();
 		} else if (tfd >= 0) {
 			close(tfd);
@@ -1101,12 +1161,9 @@ int main(int argc, char **argv)
 			if (r > 0) {
 				check = !!pfd[0].revents;
 				if (pfd[1].revents) {
-					long pid = read_fd_long(tfd);
-
-					if (pid > 0 && pid != fas.want_pid) {
-						fas.want_pid = (int)pid;
+					read_fd_long(tfd);	/* re-arm the notification */
+					if (!fas.reg_at)
 						fas.reg_at = now_ms() + REG_DELAY_MS;
-					}
 				}
 				if (pfd[2].revents & POLLIN)
 					fas_events(now_ms());
@@ -1126,10 +1183,11 @@ int main(int argc, char **argv)
 			break;
 
 		t = now_ms();
+		if (fas.fd >= 0 && !fas.reg_at && t - fas.synced_at >= RESCAN_MS)
+			fas.reg_at = t;
 		if (fas.reg_at && t >= fas.reg_at) {
 			fas.reg_at = 0;
-			if (fas.want_pid != fas.pid || fas.ctx < 0)
-				fas_register(fas.want_pid);
+			fas_sync(t);
 		}
 		if (fas.fd >= 0)
 			fas_write_state(t);
