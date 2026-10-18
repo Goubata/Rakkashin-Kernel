@@ -60,6 +60,21 @@ by **Rakkashin**
   same time. It sleeps in poll() on `/sys/kernel/avr_profile/demand_active`
   (sysfs_notify; 0 off, 1 untouched, 2 touched) while inactive, so a touch
   lifts the GPU cap instantly.
+- **Frame-aware (Encore FAS)**: every frame of the app in front is timed in
+  the kernel (encore_fas by rem01project: a uprobe on
+  `Surface::queueBuffer`, built in as `/dev/encore_fas`). A late frame, an
+  overdue frame or a frame rate below its target raises at once each CPU
+  cluster cap and the GPU cap that was actually holding it back, and that
+  frequency becomes a learned floor (held 10 s, twice as long each time it
+  is hit again, up to 2 min, then probed lower while frames stay on time).
+  So the caps settle just above what each game needs instead of hunting
+  around it, and a stutter the caps didn't cause costs no power. While
+  frames are timed, the caps run with 10 points less headroom, since a late
+  frame is caught at once. WebUI toggle, default on.
+- **No hunting**: without frame timing too, the GPU cap remembers a step
+  that saturated and checks every fall (at a lower clock the same work must
+  look proportionally busier; clearly busier means frames stopped fitting),
+  so it no longer flips between smooth and choppy.
 - **Power limit**: keep battery drain under a set wattage (WebUI). CPU power
   is predicted every 20 ms from the Energy Model and the cap set to fit the
   budget left after non-CPU power, which a real battery reading calibrates
@@ -102,6 +117,10 @@ by **Rakkashin**
 - KMI-safe: export CRCs match the stock GKI, and the stock GKI module
   signing certificate is trusted, so stock vendor and system_dlkm modules load.
 - `uname -r` reports the stock release string.
+
+Frame timing: [encore_fas](https://github.com/rem01project/encore_fas)
+(GPL-2.0, commit f408a00) by rem01project, built in unchanged except for a
+hook that reports late frames to `avr_profile`.
 
 Ported ideas from AGNi, NGK, Melt, LawRun and RealKing; original work for the profiles,
 per-app switching, thread boost, launch boost and efficiency caps.
@@ -161,6 +180,7 @@ KernelSU-Next と、性能・効率・電池持ちのための独自機能を入
 
 - **プロファイル**: バッテリー / バランス / パフォーマンス / ゲームを切り替えます。
 - **アプリごとのプロファイル**: 設定したアプリが前面にある間だけ、そのプロファイルになります。
+- **フレーム監視（Encore FAS）**: 前面のアプリが1枚描くたびに時刻を測り、カクつきを見つけたら、原因になった CPU や GPU の上限だけをすぐに上げて、その周波数を下限として覚えます。上限が原因でなければ何もしないので、電池を無駄にしません。
 - **持続パフォーマンス**: 本体が温まってきたら、操作中も CPU と GPU を必要な分だけに抑えて、発熱による性能低下を防ぎます。涼しいうちは全開です。
 - **スレッドブースト**: 前面アプリの重いスレッドに、先回りで性能の余裕を与えます。
 - **起動ブースト**: アプリの起動直後の1秒だけ、CPU を全開にします。

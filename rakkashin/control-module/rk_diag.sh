@@ -39,7 +39,7 @@ fi
 {
 echo "== kernel"
 uname -r
-for f in version status demand_active sustained sustained_temp sustained_state smart_cap power_limit; do
+for f in version status demand_active sustained sustained_temp sustained_state top_pid frame_state smart_cap power_limit; do
 	echo "$f: $(cat $K/$f 2>&1)"
 done
 cat $K/battery_caps 2>&1
@@ -72,6 +72,7 @@ for f in gpu_freq_table gpu_min_clock gpu_max_clock gpu_clock gpu_busy; do
 	echo "$f: $(cat $G/$f 2>&1)"
 done
 echo "rk_gpud: $(pgrep -f rk_gpud || echo 'not running')"
+echo "encore_fas: $([ -e /dev/encore_fas ] && echo present || echo missing)"
 
 echo "== cpufreq"
 for p in /sys/devices/system/cpu/cpufreq/policy*; do
@@ -79,10 +80,10 @@ for p in /sys/devices/system/cpu/cpufreq/policy*; do
 done
 
 if [ $PLAY = 1 ]; then N=30; WHAT="while playing"; else N=10; WHAT="untouched"; fi
-echo "== $N s sampling $WHAT: cpu max per policy | gpu max clock busy | demand_active power | sustained"
+echo "== $N s sampling $WHAT: cpu max per policy | gpu max clock busy | demand_active power | sustained | frames"
 i=0
 while [ $i -lt $N ]; do
-	echo "$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq | tr '\n' ' ')| $(cat $G/gpu_max_clock) $(cat $G/gpu_clock) $(cat $G/gpu_busy) | $(cat $K/demand_active) $(cat $K/power_limit) | $(cat $K/sustained_state 2>/dev/null)"
+	echo "$(cat /sys/devices/system/cpu/cpufreq/policy*/scaling_max_freq | tr '\n' ' ')| $(cat $G/gpu_max_clock) $(cat $G/gpu_clock) $(cat $G/gpu_busy) | $(cat $K/demand_active) $(cat $K/power_limit) | $(cat $K/sustained_state 2>/dev/null) | $(cat $K/frame_state 2>/dev/null) $(cat /data/adb/rakkashin/fas_state 2>/dev/null)"
 	i=$((i + 1))
 	sleep 1
 done

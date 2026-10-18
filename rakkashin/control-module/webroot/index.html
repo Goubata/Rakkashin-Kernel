@@ -116,6 +116,10 @@
     <div><b data-i18n="gpu_title"></b><div class="sub" data-i18n="gpu_desc"></div></div>
     <input type="checkbox" id="gpu">
   </div>
+  <div class="row" id="fasrow">
+    <div><b data-i18n="fas_title"></b><div class="sub" data-i18n="fas_desc"></div><div class="sub" id="fasstate"></div></div>
+    <input type="checkbox" id="fas">
+  </div>
   <div class="row">
     <div><b data-i18n="io_title"></b><div class="sub" data-i18n="io_desc"></div></div>
     <input type="checkbox" id="adios">
@@ -184,8 +188,14 @@ const T = {
     pw_avg: (w) => `直近60秒の平均 ${w} W`,
     pw_charging: "充電中",
     gpu_title: "GPU 効率化",
-    gpu_desc: "バッテリーとスマートバランスで、画面に触れていない間、GPU を今の描画に必要な周波数までに抑えます。触れるとすぐ解除されます。",
+    gpu_desc: "バッテリーとスマートバランスで、GPU を今の描画に必要な周波数までに抑えます。画面に触れるとすぐ解除されます（持続パフォーマンスで本体が温まっているときは、触れている間も抑えます）。足りなかった周波数は覚えて、その下には戻しません。",
     gpu_on: "GPU 効率化をオンにしました",
+    fas_title: "フレーム監視（Encore FAS）",
+    fas_desc: "前面のアプリが1枚描くたびに時刻を測り、カクつきや、目標のフレームレートを下回っているのをその場で見つけます。CPU や GPU の上限が原因なら、すぐに上げて、その周波数を下限として覚えます。上限が原因でなければ何もしないので、電池を無駄にしません。",
+    fas_on: "フレーム監視をオンにしました",
+    fas_off: "フレーム監視をオフにしました",
+    fas_watch: (fps, late, gpu, cpu) => `監視中: ${fps ? fps + " fps" : "目標を判定中"} ・ カクつき ${late} 回 ・ 上限を上げた回数 GPU ${gpu} / CPU ${cpu}`,
+    fas_idle: "前面のアプリを待っています",
     gpu_off: "GPU 効率化をオフにしました",
     io_title: "ADIOS I/O スケジューラ",
     io_desc: "ストレージの読み書きの順番を賢く決めて、アプリの起動や読み込みの待ち時間を短くします。",
@@ -249,8 +259,14 @@ const T = {
     pw_avg: (w) => `60 s average ${w} W`,
     pw_charging: "Charging",
     gpu_title: "GPU efficiency",
-    gpu_desc: "In Battery and Smart Balanced, while the screen isn't touched, holds the GPU to the frequency the current frames need. Lifted the instant you touch.",
+    gpu_desc: "In Battery and Smart Balanced, holds the GPU to the frequency the current frames need. Lifted the instant you touch (with Sustained performance on a warm phone, it stays on while you touch). A frequency that proved too low is remembered and not used again.",
     gpu_on: "GPU efficiency on",
+    fas_title: "Frame timing (Encore FAS)",
+    fas_desc: "Times every frame of the app in front and spots stutter or a frame rate below its target as it happens. If a CPU or GPU cap caused it, the cap is raised at once and that frequency is remembered as a floor. If not, nothing changes, so no battery is wasted.",
+    fas_on: "Frame timing on",
+    fas_off: "Frame timing off",
+    fas_watch: (fps, late, gpu, cpu) => `Watching: ${fps ? fps + " fps" : "finding the target"} · ${late} late frames · caps raised GPU ${gpu} / CPU ${cpu}`,
+    fas_idle: "Waiting for an app in front",
     gpu_off: "GPU efficiency off",
     io_title: "ADIOS I/O scheduler",
     io_desc: "Orders storage reads and writes smartly to cut wait times when apps start or load.",
@@ -514,19 +530,39 @@ async function init() {
   bindToggle("tb", TB, "tboost");
   const gpu = document.getElementById("gpu");
   const gpuOk = (await exec(`[ -e ${NODE}/demand_active ] && [ -w /sys/kernel/gpu/gpu_max_clock ]`)).errno === 0;
+  // gpud.sh restarts rk_gpud with both settings; SIGTERM makes it restore
+  // the GPU max clock first
+  const gpud = (file, on) =>
+    exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/${file}; sh ${MODDIR}/gpud.sh restart`);
   if (!gpuOk) {
     document.getElementById("gpurow").style.display = "none";
   } else {
     gpu.checked = (await exec(`cat ${STATE}/gpu 2>/dev/null`)).stdout.trim() !== "0";
     gpu.onchange = async () => {
-      const on = gpu.checked;
-      const start = `chmod 755 ${MODDIR}/bin/rk_gpud; setsid ${MODDIR}/bin/rk_gpud </dev/null >/dev/null 2>&1 &`;
-      // stopping sends SIGTERM, which makes rk_gpud restore the GPU max clock
-      // rk_gpud restores the max clock on SIGTERM; dropping its saved
-      // original makes the next start record the current max afresh
-      await exec(`mkdir -p ${STATE} && echo ${on ? 1 : 0} > ${STATE}/gpu; pkill -f ${MODDIR}/bin/rk_gpud; sleep 0.2; rm -f ${STATE}/gpu_orig_max; ${on ? start : "true"}`);
-      status(on ? T.gpu_on : T.gpu_off);
+      await gpud("gpu", gpu.checked);
+      status(gpu.checked ? T.gpu_on : T.gpu_off);
     };
+  }
+  const fas = document.getElementById("fas");
+  const fasOk = (await exec(`[ -e /dev/encore_fas ] && [ -e ${NODE}/top_pid ]`)).errno === 0;
+  if (!fasOk) {
+    document.getElementById("fasrow").style.display = "none";
+  } else {
+    fas.checked = (await exec(`cat ${STATE}/fas 2>/dev/null`)).stdout.trim() !== "0";
+    fas.onchange = async () => {
+      await gpud("fas", fas.checked);
+      status(fas.checked ? T.fas_on : T.fas_off);
+    };
+    const showFas = async () => {
+      const el = document.getElementById("fasstate");
+      if (!fas.checked) { el.textContent = ""; return; }
+      const r = (await exec(`cat ${STATE}/fas_state 2>/dev/null; cat ${NODE}/frame_state`)).stdout;
+      const m = r.match(/pid=(\d+) fps=(\d+) degraded=\d late=(\d+) gpu_lifts=(\d+)/);
+      const k = r.match(/janks=(\d+)/);
+      el.textContent = m && m[1] !== "0" ? T.fas_watch(Number(m[2]), m[3], m[4], k ? k[1] : "0") : T.fas_idle;
+    };
+    showFas();
+    setInterval(() => { if (!document.hidden) showFas(); }, 3000);
   }
   const io = document.getElementById("adios");
   io.checked = (await exec(`cat ${STATE}/adios 2>/dev/null`)).stdout.trim() !== "0";

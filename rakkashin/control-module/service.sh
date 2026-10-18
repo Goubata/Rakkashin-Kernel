@@ -40,16 +40,10 @@ if [ "$(cat "$STATE/zram2" 2>/dev/null)" != 0 ]; then
 	sh "$MODDIR/zram.sh" setup && sh "$MODDIR/zram.sh" loop &
 fi
 
-# GPU demand governor (default on; "0" in $STATE/gpu disables it). Needs a
-# kernel with demand_active and the kgsl /sys/kernel/gpu interface.
-if [ "$(cat "$STATE/gpu" 2>/dev/null)" != 0 ] && [ -e "$K/demand_active" ] &&
-   [ -w /sys/kernel/gpu/gpu_max_clock ]; then
-	chmod 755 "$MODDIR/bin/rk_gpud"
-	# the saved original max only guards restarts within one boot; record
-	# afresh each boot so changes to the GPU max (e.g. an underclock) count
-	rm -f "$STATE/gpu_orig_max"
-	"$MODDIR/bin/rk_gpud" </dev/null >/dev/null 2>&1 &
-fi
+# GPU demand governor and frame timing (each default on; "0" in
+# $STATE/gpu or $STATE/fas disables it). Needs a kernel with demand_active;
+# GPU caps need kgsl /sys/kernel/gpu, frame timing /dev/encore_fas.
+sh "$MODDIR/gpud.sh" restart
 
 # The kernel sysfs_notify()s "mode" on every switch; inotifyd blocks until
 # then, so this costs nothing while idle.

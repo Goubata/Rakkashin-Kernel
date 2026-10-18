@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config ENCORE_FAS
+	tristate "Encore FAS frame telemetry (/dev/encore_fas)"
+	depends on ARM64 && UPROBES
+	default n
+	help
+	  Frame aware scheduling telemetry from Encore Tweaks
+	  (rem01project/encore_fas). A uprobe on Surface::queueBuffer of the
+	  foreground app times every frame and reports late frames, a low
+	  frame rate and pauses to a daemon, and (Rakkashin) to avr_profile,
+	  which lifts the demand-matched CPU caps that held a frame back.

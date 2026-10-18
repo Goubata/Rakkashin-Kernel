@@ -50,6 +50,19 @@
  * saturated, and only come down after a second of lower load, so frame
  * bursts are never squeezed. The fixed smart_cap is still lifted on touch.
  *
+ * Frame-aware (encore_fas): the foreground app's frames are timed by a
+ * uprobe on Surface::queueBuffer (drivers/misc/encore_fas, registered by
+ * the control module's rk_gpud for top_pid). A late frame, an overdue frame
+ * or a frame rate deficit lifts the demand cap of every cluster whose cap
+ * was actually holding it back (running at it within the last
+ * JANK_BOUND_TICKS) and leaves a learned floor there: held for 10 s, held
+ * twice as long each time it is hit again (up to 2 min), then probed 5% of
+ * max lower every 5 s while frames stay on time. So the caps settle just
+ * above what each game really needs instead of hunting around it, and a
+ * jank that our caps didn't cause costs no power at all. While frames are
+ * being timed, a late one is caught within a frame, so the caps run with
+ * FAS_HEADROOM_CUT points less headroom.
+ *
  * CPU frequency is steered only through cpufreq's frequency QoS, the same
  * mechanism thermal mitigation uses. QoS takes the lowest max request and
  * the highest min request, and the policy max always wins over min, so a
@@ -76,7 +89,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.7 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.8 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -136,6 +149,10 @@ struct avr_policy_reqs {
 	s32 dcap;		/* demand cap in kHz, 0 = start from measured need,
 				   DCAP_TOP = start from the top (touch) */
 	unsigned int low_ticks;	/* consecutive ticks the need sat well below dcap */
+	unsigned int bound_age;	/* ticks since a CPU last ran at dcap */
+	s32 jfloor;		/* learned from late frames, kHz; 0 = none */
+	unsigned int jticks;	/* ticks until the floor is probed lower */
+	unsigned int jhold;	/* hold of the floor, doubles on repeat */
 };
 
 /* indexed by policy->cpu, the policy's owning CPU */
@@ -177,6 +194,21 @@ static unsigned long last_kick;			/* jiffies of the last touch/launch */
 #define DEMAND_WIN_MAX_US	200000	/* idle-time windows longer than this are stale */
 #define DCAP_TOP		S32_MAX
 #define TEMP_EVERY		50	/* read the skin temperature every 1s */
+/* frame events (encore_fas) */
+#define JANK_BOUND_TICKS	5	/* a cap at work this recently held the frame */
+#define JANK_STALE_MS		100	/* older events no longer describe the caps */
+#define JFLOOR_HOLD_TICKS	500	/* 10 s */
+#define JFLOOR_HOLD_MAX_TICKS	6000	/* 2 min */
+#define JFLOOR_PROBE_TICKS	250	/* then 5% lower every 5 s */
+static atomic_t fas_pending = ATOMIC_INIT(0);	/* worst level since the last tick */
+static unsigned long fas_pending_at;		/* jiffies of that event */
+static unsigned int fas_janks;			/* late frames that lifted a cap */
+static bool fas_reset;				/* foreground app changed: forget floors */
+static pid_t top_pid;				/* foreground app process */
+static unsigned long fas_seen;			/* jiffies of the last timed frame */
+#define FAS_SEEN_MS		1000	/* frames timed this recently: timing is live */
+#define FAS_HEADROOM_CUT	10	/* less headroom while frames are timed */
+#define FAS_HEADROOM_MIN	15
 #define DEMAND_FLOOR_PCT	30	/* never cap below this share of max */
 #define DEMAND_FALL_TICKS	5	/* need must stay low this long before lowering */
 #define DEMAND_SAT_PCT		90	/* a CPU this busy at the cap is saturated */
@@ -293,7 +325,7 @@ static unsigned int touch_headroom(void)
  * The vendor governor can't overshoot it, so the same work runs at lower
  * frequency and voltage.
  */
-static void demand_update(struct cpufreq_policy *policy)
+static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 {
 	struct avr_policy_reqs *r = &reqs[policy->cpu];
 	unsigned int fmax = policy->cpuinfo.max_freq;
@@ -303,7 +335,7 @@ static void demand_update(struct cpufreq_policy *policy)
 	s32 cur, limit;
 	unsigned long need = 0;
 	bool saturated = false;
-	unsigned int cpu;
+	unsigned int cpu, headroom;
 	s32 want;
 
 	if (!fmax)
@@ -315,6 +347,14 @@ static void demand_update(struct cpufreq_policy *policy)
 	cur = r->dcap ? r->dcap : (s32)fmax;
 	/* the limit actually in force, which may be below our own cap */
 	limit = min_t(s32, cur, READ_ONCE(policy->max));
+	if (!r->dcap)			/* fresh start: never ran at a cap yet */
+		r->bound_age = UINT_MAX;
+	/* our cap (not thermal or another limit) is what the CPUs ran into */
+	else if (r->dcap && r->dcap < (s32)fmax && cur <= (s32)READ_ONCE(policy->max) &&
+	    (u64)khz * 100 >= (u64)cur * 95)
+		r->bound_age = 0;
+	else if (r->bound_age < UINT_MAX)
+		r->bound_age++;
 
 	for_each_cpu(cpu, policy->cpus) {
 		unsigned long cap = max(arch_scale_cpu_capacity(cpu), 1UL);
@@ -339,8 +379,38 @@ static void demand_update(struct cpufreq_policy *policy)
 		win_wall[cpu] = wall;
 		win_idle[cpu] = idle;
 	}
-	want = clamp_t(s32, need * (100 + (touched ? touch_headroom() :
-					    DEMAND_HEADROOM_PCT)) / 100, floor, fmax);
+	headroom = touched ? touch_headroom() : DEMAND_HEADROOM_PCT;
+	if (time_before(jiffies, READ_ONCE(fas_seen) + msecs_to_jiffies(FAS_SEEN_MS)))
+		headroom = headroom > FAS_HEADROOM_MIN + FAS_HEADROOM_CUT ?
+			   headroom - FAS_HEADROOM_CUT :
+			   min_t(unsigned int, headroom, FAS_HEADROOM_MIN);
+	want = clamp_t(s32, need * (100 + headroom) / 100, floor, fmax);
+
+	/* a late frame while this cap held the CPUs back: lift, remember */
+	if (jank && r->dcap && r->dcap < (s32)fmax &&
+	    r->bound_age <= JANK_BOUND_TICKS) {
+		s32 f = min_t(s32, fmax, r->dcap + fmax / (jank > 1 ? 5 : 10));
+
+		r->jhold = r->jfloor ? min_t(unsigned int, r->jhold * 2,
+					     JFLOOR_HOLD_MAX_TICKS) :
+				       JFLOOR_HOLD_TICKS;
+		r->jfloor = max(r->jfloor, f);
+		r->jticks = r->jhold;
+		r->dcap = jank > 1 ? (s32)fmax : max(r->dcap, f);
+		r->low_ticks = 0;
+		fas_janks++;
+	} else if (r->jfloor) {
+		/* frames on time: try a little lower now and then */
+		if (r->jticks) {
+			r->jticks--;
+		} else {
+			r->jfloor -= fmax / 20;
+			r->jticks = JFLOOR_PROBE_TICKS;
+			if (r->jfloor <= floor)
+				r->jfloor = 0;
+		}
+	}
+	want = max(want, r->jfloor);
 
 	if (!r->dcap) {			/* fresh start: take the need as is */
 		r->dcap = want;
@@ -721,7 +791,7 @@ static int skin_temp(void)
 static void gov_fn(struct work_struct *work)
 {
 	unsigned int limit = READ_ONCE(power_limit_mw);
-	unsigned int mw = 0, cpu;
+	unsigned int mw = 0, cpu, jank;
 	/* tick 1 after a (re)set measures at once, then every POWER_EVERY */
 	bool measure = limit && ++power_tick % POWER_EVERY == 1;
 	bool tmeasure = READ_ONCE(sustained) && temp_tick++ % TEMP_EVERY == 0;
@@ -733,7 +803,17 @@ static void gov_fn(struct work_struct *work)
 	if (tmeasure)
 		temp = skin_temp();
 
+	jank = atomic_xchg(&fas_pending, 0);
+	if (jank && time_after(jiffies, READ_ONCE(fas_pending_at) +
+			       msecs_to_jiffies(JANK_STALE_MS)))
+		jank = 0;
+
 	mutex_lock(&avr_lock);
+	if (READ_ONCE(fas_reset)) {
+		WRITE_ONCE(fas_reset, false);
+		for_each_possible_cpu(cpu)
+			reqs[cpu].jfloor = 0;
+	}
 	if (tmeasure) {
 		skin_mc = temp;
 		skin_read = true;
@@ -749,9 +829,11 @@ static void gov_fn(struct work_struct *work)
 			continue;
 		if (policy->cpu == cpu) {
 			if (demand_tracked())
-				demand_update(policy);
-			else
+				demand_update(policy, jank);
+			else {
 				reqs[cpu].dcap = 0;	/* re-measure when capping resumes */
+				reqs[cpu].bound_age = UINT_MAX;
+			}
 		}
 		cpufreq_cpu_put(policy);
 	}
@@ -812,6 +894,34 @@ static void smart_drop_fn(struct work_struct *work)
 			gov_kick();
 	}
 	mutex_unlock(&avr_lock);
+}
+
+/* every frame of a timed app (encore_fas uprobe handler): timing is live */
+void avr_profile_frame_seen(void)
+{
+	unsigned long now = jiffies;
+
+	if (READ_ONCE(fas_seen) != now)
+		WRITE_ONCE(fas_seen, now);
+}
+
+/*
+ * A frame of the foreground app was late, from encore_fas: uprobe handler
+ * (process context, after its spinlock) or its watchdog hrtimer (softirq).
+ * Lock-free; the demand loop runs at once and lifts the caps that held the
+ * frame back. Without a demand cap there is nothing to lift.
+ */
+void avr_profile_frame_event(unsigned int level)
+{
+	int old = atomic_read(&fas_pending);
+
+	if (!READ_ONCE(smart_armed) || !modes[READ_ONCE(cur_mode)].demand)
+		return;
+	while (old < (int)level &&
+	       !atomic_try_cmpxchg(&fas_pending, &old, (int)level))
+		;
+	WRITE_ONCE(fas_pending_at, jiffies);
+	mod_delayed_work(system_unbound_wq, &gov_work, 0);
 }
 
 /* Touch or app launch: cheap enough to call from input event context. */
@@ -952,6 +1062,13 @@ static DECLARE_DELAYED_WORK(app_check_work, app_check_fn);
  * Called from cpuset_attach_task() with cpuset_mutex held: only look and
  * queue work here, the mode switch itself takes cpufreq locks.
  */
+static void top_pid_fn(struct work_struct *work)
+{
+	if (avr_kobj)
+		sysfs_notify(avr_kobj, NULL, "top_pid");
+}
+static DECLARE_WORK(top_pid_work, top_pid_fn);
+
 void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 			       struct task_struct *task)
 {
@@ -966,11 +1083,23 @@ void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 		rk_tboost_set_top_app(css);
 	}
 
-	if (!READ_ONCE(per_app) || !READ_ONCE(nr_app_profiles))
-		return;
-
 	uid = from_kuid(&init_user_ns, task_uid(task));
 	if (uid % 100000 < 10000)	/* system UIDs never decide this */
+		return;
+
+	/*
+	 * The app process now in front, for frame timing (encore_fas): a
+	 * regular app UID only, not an isolated or SDK sandbox process (a
+	 * browser's renderer joins top-app too but draws through another).
+	 */
+	if (uid % 100000 <= 19999 && thread_group_leader(task) &&
+	    task->tgid != READ_ONCE(top_pid)) {
+		WRITE_ONCE(top_pid, task->tgid);
+		WRITE_ONCE(fas_reset, true);	/* its floors were another app's */
+		queue_work(system_unbound_wq, &top_pid_work);
+	}
+
+	if (!READ_ONCE(per_app) || !READ_ONCE(nr_app_profiles))
 		return;
 
 	if (app_mode(uid) >= 0) {
@@ -1182,6 +1311,39 @@ static ssize_t sustained_state_show(struct kobject *kobj,
 
 static struct kobj_attribute sustained_state_attr = __ATTR_RO(sustained_state);
 
+/* the foreground app's process; pollable (sysfs_notify on change) */
+static ssize_t top_pid_show(struct kobject *kobj, struct kobj_attribute *attr,
+			    char *buf)
+{
+	return sysfs_emit(buf, "%d\n", READ_ONCE(top_pid));
+}
+
+static struct kobj_attribute top_pid_attr = __ATTR_RO(top_pid);
+
+/* "janks=<n> floors=cpu0:<kHz>,cpu6:<kHz>": frame-aware state */
+static ssize_t frame_state_show(struct kobject *kobj,
+				struct kobj_attribute *attr, char *buf)
+{
+	unsigned int cpu;
+	int len;
+	bool first = true;
+
+	mutex_lock(&avr_lock);
+	len = sysfs_emit(buf, "janks=%u floors=", fas_janks);
+	for_each_possible_cpu(cpu) {
+		if (!reqs[cpu].added)
+			continue;
+		len += sysfs_emit_at(buf, len, "%scpu%u:%d", first ? "" : ",",
+				     cpu, reqs[cpu].jfloor);
+		first = false;
+	}
+	mutex_unlock(&avr_lock);
+	len += sysfs_emit_at(buf, len, "\n");
+	return len;
+}
+
+static struct kobj_attribute frame_state_attr = __ATTR_RO(frame_state);
+
 /* "limit=<mW> now=<mW> cpu_cap=<%>"; write a limit in mW, 0 = off */
 static ssize_t power_limit_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -1340,6 +1502,8 @@ static struct attribute *avr_profile_attrs[] = {
 	&sustained_attr.attr,
 	&sustained_temp_attr.attr,
 	&sustained_state_attr.attr,
+	&top_pid_attr.attr,
+	&frame_state_attr.attr,
 	&power_limit_attr.attr,
 	NULL
 };
