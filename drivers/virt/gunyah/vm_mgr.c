@@ -1100,6 +1100,16 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 
 		return gunyah_vm_set_auth_type(ghvm, &auth_desc);
 	}
+	case GH_VM_CHECK_EXTENSION:
+		switch (arg) {
+		case GH_CAP_VCPU_TIMER_WAKEUP:
+			r = 1;
+			break;
+		default:
+			r = 0;
+			break;
+		}
+		break;
 	default:
 		r = -ENOTTY;
 		break;
@@ -1177,6 +1187,8 @@ static void _gunyah_vm_put(struct kref *kref)
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
 		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));
+		if (b->mem_type == VM_MEM_CMA && b->cma.file)
+			fput(b->cma.file);
 		kfree(b);
 	}
 	up_write(&ghvm->bindings_lock);

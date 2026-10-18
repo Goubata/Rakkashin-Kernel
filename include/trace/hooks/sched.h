@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM sched
+#undef TRACE_INCLUDE_PATH
 #define TRACE_INCLUDE_PATH trace/hooks
 #if !defined(_TRACE_HOOK_SCHED_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_SCHED_H
@@ -25,6 +26,10 @@ DECLARE_RESTRICTED_HOOK(android_rvh_select_task_rq_dl,
 DECLARE_RESTRICTED_HOOK(android_rvh_select_fallback_rq,
 	TP_PROTO(int cpu, struct task_struct *p, int *new_cpu),
 	TP_ARGS(cpu, p, new_cpu), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh___set_task_cpu,
+	TP_PROTO(struct task_struct *p, unsigned int new_cpu),
+	TP_ARGS(p, new_cpu), 1);
 
 struct rq;
 DECLARE_HOOK(android_vh_scheduler_tick,
@@ -474,6 +479,9 @@ DECLARE_HOOK(android_vh_scx_task_switch_finish,
 DECLARE_HOOK(android_vh_scx_task_can_run_on,
 	TP_PROTO(bool *disallow, struct task_struct *p, struct rq *rq),
 	TP_ARGS(disallow, p, rq));
+DECLARE_HOOK(android_rvh_check_class_changing,
+	TP_PROTO(struct rq *rq, struct task_struct *p, const struct sched_class *prev_class),
+	TP_ARGS(rq, p, prev_class));
 
 struct scx_exit_info;
 DECLARE_HOOK(android_vh_scx_exit_on_abnormal,
@@ -484,14 +492,13 @@ DECLARE_HOOK(android_vh_switching_to_scx,
 	TP_PROTO(struct rq *rq, struct task_struct *p),
 	TP_ARGS(rq, p));
 
-struct sugov_policy;
-DECLARE_RESTRICTED_HOOK(android_rvh_set_sugov_update,
-	TP_PROTO(struct sugov_policy *sg_policy, unsigned int next_freq, bool *should_update),
-	TP_ARGS(sg_policy, next_freq, should_update), 1);
-
 DECLARE_RESTRICTED_HOOK(android_rvh_update_rq_clock_pelt,
 	TP_PROTO(struct rq *rq, s64 delta, int *ret),
 	TP_ARGS(rq, delta, ret), 1);
+
+DECLARE_RESTRICTED_HOOK(android_rvh_update_load_sum,
+	TP_PROTO(int *force_update),
+	TP_ARGS(force_update), 1);
 
 DECLARE_RESTRICTED_HOOK(android_rvh_update_load_avg_blocked_se,
 	TP_PROTO(u64 now, struct sched_entity *se, int *ret),
@@ -592,6 +599,11 @@ DECLARE_HOOK(android_vh_chk_task,
 DECLARE_HOOK(android_vh_put_task,
 	TP_PROTO(struct task_struct *p),
 	TP_ARGS(p));
+
+DECLARE_RESTRICTED_HOOK(android_rvh_task_fits_cpu,
+	TP_PROTO(struct task_struct *tsk, unsigned long util, unsigned long uclamp_min,
+		 unsigned long uclamp_max, int cpu, bool *fits, bool *done),
+	TP_ARGS(tsk, util, uclamp_min, uclamp_max, cpu, fits, done), 1);
 
 /* macro versions of hooks are no longer required */
 

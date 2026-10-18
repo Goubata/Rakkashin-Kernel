@@ -2,6 +2,7 @@
   access_process_vm
   activate_task
   add_cpu
+  add_memory_driver_managed
   addrconf_add_linklocal
   addrconf_prefix_rcv_add_addr
   add_taint
@@ -499,6 +500,7 @@
   dev_kfree_skb_any_reason
   dev_kfree_skb_irq_reason
   dev_load
+  dev_lstats_read
   __devm_add_action
   devm_alloc_etherdev_mqs
   __devm_alloc_percpu
@@ -790,12 +792,12 @@
   drm_atomic_helper_commit_modeset_disables
   drm_atomic_helper_commit_modeset_enables
   drm_atomic_helper_commit_planes
-  __drm_atomic_helper_connector_destroy_state
   drm_atomic_helper_connector_destroy_state
-  __drm_atomic_helper_connector_duplicate_state
+  __drm_atomic_helper_connector_destroy_state
   drm_atomic_helper_connector_duplicate_state
-  __drm_atomic_helper_connector_reset
+  __drm_atomic_helper_connector_duplicate_state
   drm_atomic_helper_connector_reset
+  __drm_atomic_helper_connector_reset
   __drm_atomic_helper_crtc_destroy_state
   __drm_atomic_helper_crtc_duplicate_state
   drm_atomic_helper_damage_iter_init
@@ -1104,6 +1106,7 @@
   generic_handle_irq_safe
   generic_hwtstamp_get_lower
   generic_hwtstamp_set_lower
+  generic_online_page
   generic_write_checks
   genlmsg_multicast_allns
   genlmsg_put
@@ -1672,6 +1675,8 @@
   memdup_user
   memmove
   memory_cgrp_subsys_on_dfl_key
+  memory_group_register_dynamic
+  memory_group_unregister
   memory_read_from_buffer
   memparse
   mempool_alloc_noprof
@@ -1690,6 +1695,7 @@
   memstart_addr
   memunmap
   metadata_dst_alloc
+  mhp_get_pluggable_range
   migrate_swap
   __migrate_task
   mipi_dsi_attach
@@ -1797,8 +1803,8 @@
   __netif_napi_del
   netif_receive_skb
   netif_receive_skb_list
-  __netif_rx
   netif_rx
+  __netif_rx
   netif_set_tso_max_size
   netif_stacked_transfer_operstate
   netif_tx_lock
@@ -1960,6 +1966,8 @@
   out_of_line_wait_on_bit_timeout
   overflowgid
   overflowuid
+  page_offline_begin
+  page_offline_end
   page_pinner_inited
   __page_pinner_put_page
   page_pool_alloc_pages
@@ -2186,8 +2194,8 @@
   pm_genpd_init
   pm_genpd_remove_device
   pm_get_active_wakeup_sources
-  __pm_relax
   pm_relax
+  __pm_relax
   pm_runtime_allow
   __pm_runtime_disable
   pm_runtime_enable
@@ -2202,8 +2210,8 @@
   __pm_runtime_set_status
   __pm_runtime_suspend
   __pm_runtime_use_autosuspend
-  __pm_stay_awake
   pm_stay_awake
+  __pm_stay_awake
   pm_suspend_default_s2idle
   pm_suspend_target_state
   pm_system_wakeup
@@ -2240,8 +2248,8 @@
   proc_dointvec_jiffies
   proc_dointvec_minmax
   proc_doulongvec_minmax
-  _proc_mkdir
   proc_mkdir
+  _proc_mkdir
   proc_mkdir_data
   proc_remove
   proc_set_user
@@ -2438,6 +2446,7 @@
   __reset_control_get
   reset_control_put
   reset_control_reset
+  restore_online_page_callback
   return_address
   rhashtable_destroy
   rhashtable_free_and_destroy
@@ -2602,6 +2611,7 @@
   set_disk_ro
   set_freezable
   set_normalized_timespec64
+  set_online_page_callback
   set_page_dirty
   set_page_dirty_lock
   __SetPageMovable
@@ -2672,6 +2682,7 @@
   skb_queue_purge_reason
   skb_queue_tail
   skb_realloc_headroom
+  __skb_recv_datagram
   skb_recv_datagram
   skb_scrub_packet
   skb_set_owner_w
@@ -3311,6 +3322,9 @@
   tty_vhangup
   tty_wakeup
   tty_write_room
+  tun_get_socket
+  tun_get_tx_ring
+  tun_ptr_free
   typec_get_drvdata
   typec_mux_get_drvdata
   typec_mux_put
@@ -3683,6 +3697,7 @@
   vfree
   vfs_fsync_range
   vfs_llseek
+  vfs_truncate
   video_devdata
   video_device_alloc
   video_device_release
@@ -3785,14 +3800,16 @@
   vring_transport_features
   vscnprintf
   vsnprintf
+  vsock_addr_bound
+  vsock_addr_cast
   vsock_addr_equals_addr
   vsock_addr_init
-  vsock_addr_cast
-  vsock_addr_bound
+  vsock_add_tap
   vsock_core_register
   vsock_core_unregister
   vsock_deliver_tap
   vsock_for_each_connected_socket
+  vsock_remove_tap
   vsprintf
   vsscanf
   vunmap

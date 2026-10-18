@@ -112,9 +112,10 @@
 struct selinux_state selinux_state;
 
 /*
- * ANDROID: selinux_state is part of the KMI, and adding memfd_class as part of the policycap
- * array in the structure would break the KMI, so declare it outside.
+ * ANDROID: selinux_state is part of the KMI, and backporting capabilities into
+ * the policycap array in it break the KMI, so declare it outside.
  */
+bool selinux_seclabel_wildcard_policycap;
 bool selinux_memfd_class_policycap;
 
 /* SECMARK reference count */
@@ -2933,7 +2934,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 {
 	const struct task_security_struct *tsec = selinux_cred(current_cred());
 	struct superblock_security_struct *sbsec;
-	struct xattr *xattr = lsm_get_xattr_slot(xattrs, xattr_count);
+	struct xattr *xattr;
 	u32 newsid, clen;
 	u16 newsclass;
 	int rc;
@@ -2959,6 +2960,7 @@ static int selinux_inode_init_security(struct inode *inode, struct inode *dir,
 	    !(sbsec->flags & SBLABEL_MNT))
 		return -EOPNOTSUPP;
 
+	xattr = lsm_get_xattr_slot(xattrs, xattr_count);
 	if (xattr) {
 		rc = security_sid_to_context_force(newsid,
 						   &context, &clen);

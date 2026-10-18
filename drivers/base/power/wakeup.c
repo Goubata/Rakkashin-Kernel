@@ -18,6 +18,7 @@
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 #include <linux/wakeup_reason.h>
+#include <linux/string.h>
 #include <trace/events/power.h>
 
 #include "power.h"
@@ -34,6 +35,8 @@ bool events_check_enabled __read_mostly;
 /* First wakeup IRQ seen by the kernel in the last cycle. */
 static unsigned int wakeup_irq[2] __read_mostly;
 static DEFINE_RAW_SPINLOCK(wakeup_irq_lock);
+static unsigned int pm_wakeup_irq_number[2];
+static char pm_wakeup_irq_name[2][MAX_WAKEUP_REASON_IRQ_NAME_LEN];
 
 /* If greater than 0 and the system is suspending, terminate the suspend. */
 static atomic_t pm_abort_suspend __read_mostly;
@@ -283,9 +286,7 @@ EXPORT_SYMBOL_GPL(wakeup_sources_read_unlock);
  */
 struct wakeup_source *wakeup_sources_walk_start(void)
 {
-	struct list_head *ws_head = &wakeup_sources;
-
-	return list_entry_rcu(ws_head->next, struct wakeup_source, entry);
+	return list_first_or_null_rcu(&wakeup_sources, struct wakeup_source, entry);
 }
 EXPORT_SYMBOL_GPL(wakeup_sources_walk_start);
 
@@ -955,12 +956,19 @@ void pm_wakeup_clear(unsigned int irq_number)
 {
 	raw_spin_lock_irq(&wakeup_irq_lock);
 
-	if (irq_number && wakeup_irq[0] == irq_number)
+	if (irq_number && wakeup_irq[0] == irq_number) {
 		wakeup_irq[0] = wakeup_irq[1];
-	else
+		pm_wakeup_irq_number[0] = pm_wakeup_irq_number[1];
+		strscpy(pm_wakeup_irq_name[0], pm_wakeup_irq_name[1], sizeof(pm_wakeup_irq_name[0]));
+	} else {
 		wakeup_irq[0] = 0;
+		pm_wakeup_irq_number[0] = 0;
+		pm_wakeup_irq_name[0][0] = '\0';
+	}
 
 	wakeup_irq[1] = 0;
+	pm_wakeup_irq_number[1] = 0;
+	pm_wakeup_irq_name[1][0] = '\0';
 
 	raw_spin_unlock_irq(&wakeup_irq_lock);
 
@@ -968,36 +976,69 @@ void pm_wakeup_clear(unsigned int irq_number)
 		atomic_set(&pm_abort_suspend, 0);
 }
 
+void pm_print_wakeup_irq(void)
+{
+	unsigned long flags;
+	unsigned int irq[2];
+	char name[2][MAX_WAKEUP_REASON_IRQ_NAME_LEN];
+	int i;
+
+	if (!READ_ONCE(pm_wakeup_irq_number[0]) && !READ_ONCE(pm_wakeup_irq_number[1]))
+		return;
+
+	raw_spin_lock_irqsave(&wakeup_irq_lock, flags);
+	for (i = 0; i < 2; i++) {
+		irq[i] = pm_wakeup_irq_number[i];
+		if (irq[i]) {
+			strscpy(name[i], pm_wakeup_irq_name[i], sizeof(name[i]));
+			pm_wakeup_irq_number[i] = 0;
+			pm_wakeup_irq_name[i][0] = '\0';
+		}
+	}
+	raw_spin_unlock_irqrestore(&wakeup_irq_lock, flags);
+
+	for (i = 0; i < 2; i++) {
+		if (irq[i]) {
+			pm_pr_dbg("Triggering wakeup from IRQ %u\n", irq[i]);
+			pr_warn("pm_system_irq_wakeup: %u triggered %s\n", irq[i], name[i]);
+		}
+	}
+}
+
 void pm_system_irq_wakeup(unsigned int irq_number)
 {
 	unsigned long flags;
+	struct irq_desc *desc;
+	const char *name = "(unnamed)";
+	int idx = -1;
 
 	raw_spin_lock_irqsave(&wakeup_irq_lock, flags);
 
-	if (wakeup_irq[0] == 0)
+	if (wakeup_irq[0] == 0) {
 		wakeup_irq[0] = irq_number;
-	else if (wakeup_irq[1] == 0)
+		idx = 0;
+	} else if (wakeup_irq[1] == 0) {
 		wakeup_irq[1] = irq_number;
-	else
+		idx = 1;
+	} else {
 		irq_number = 0;
-
-	pm_pr_dbg("Triggering wakeup from IRQ %d\n", irq_number);
-
-	raw_spin_unlock_irqrestore(&wakeup_irq_lock, flags);
+	}
 
 	if (irq_number) {
-		struct irq_desc *desc;
-		const char *name = "null";
-
 		desc = irq_to_desc(irq_number);
 		if (desc == NULL)
 			name = "stray irq";
 		else if (desc->action && desc->action->name)
 			name = desc->action->name;
 
-		log_irq_wakeup_reason(irq_number);
-		pr_warn("%s: %d triggered %s\n", __func__, irq_number, name);
+		pm_wakeup_irq_number[idx] = irq_number;
+		strscpy(pm_wakeup_irq_name[idx], name, sizeof(pm_wakeup_irq_name[idx]));
+	}
 
+	raw_spin_unlock_irqrestore(&wakeup_irq_lock, flags);
+
+	if (irq_number) {
+		log_irq_wakeup_reason(irq_number);
 		pm_system_wakeup();
 	}
 }
@@ -1230,11 +1271,78 @@ static const struct file_operations wakeup_sources_stats_fops = {
 	.release = seq_release_private,
 };
 
-static int __init wakeup_sources_debugfs_init(void)
+#ifdef CONFIG_BPF_SYSCALL
+#include <linux/btf.h>
+
+__bpf_kfunc_start_defs();
+
+/**
+ * bpf_wakeup_sources_read_lock - Acquire the SRCU lock for wakeup sources
+ *
+ * The underlying SRCU lock returns an integer index. However, the BPF verifier
+ * requires a pointer (PTR_TO_BTF_ID) to strictly track the state of acquired
+ * resources using KF_ACQUIRE and KF_RELEASE semantics. We use an opaque
+ * structure pointer (struct bpf_ws_lock *) to satisfy the verifier while
+ * safely encoding the integer index within the pointer address itself.
+ *
+ * Return: An opaque pointer encoding the SRCU lock index + 1 (to avoid NULL).
+ */
+__bpf_kfunc struct bpf_ws_lock *bpf_wakeup_sources_read_lock(void)
+{
+	return (struct bpf_ws_lock *)(long)(wakeup_sources_read_lock() + 1);
+}
+
+/**
+ * bpf_wakeup_sources_read_unlock - Release the SRCU lock for wakeup sources
+ * @lock: The opaque pointer returned by bpf_wakeup_sources_read_lock()
+ *
+ * The BPF verifier guarantees that @lock is a valid, unreleased pointer from
+ * the acquire function. We decode the pointer back into the integer SRCU index
+ * by subtracting 1 and release the lock.
+ */
+__bpf_kfunc void bpf_wakeup_sources_read_unlock(struct bpf_ws_lock *lock)
+{
+	wakeup_sources_read_unlock((int)(long)lock - 1);
+}
+
+/**
+ * bpf_wakeup_sources_get_head - Get the head of the wakeup sources list
+ *
+ * Return: The head of the wakeup sources list.
+ */
+__bpf_kfunc void *bpf_wakeup_sources_get_head(void)
+{
+	return &wakeup_sources;
+}
+
+__bpf_kfunc_end_defs();
+
+BTF_KFUNCS_START(wakeup_source_kfunc_ids)
+BTF_ID_FLAGS(func, bpf_wakeup_sources_read_lock, KF_ACQUIRE)
+BTF_ID_FLAGS(func, bpf_wakeup_sources_read_unlock, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_wakeup_sources_get_head)
+BTF_KFUNCS_END(wakeup_source_kfunc_ids)
+
+static const struct btf_kfunc_id_set wakeup_source_kfunc_set = {
+	.set   = &wakeup_source_kfunc_ids,
+};
+
+static void __init wakeup_sources_bpf_init(void)
+{
+	if (register_btf_kfunc_id_set(BPF_PROG_TYPE_SYSCALL, &wakeup_source_kfunc_set))
+		pm_pr_dbg("Wakeup: failed to register BTF kfuncs\n");
+}
+#else
+static inline void wakeup_sources_bpf_init(void) {}
+#endif /* CONFIG_BPF_SYSCALL */
+
+static int __init wakeup_sources_init(void)
 {
 	debugfs_create_file("wakeup_sources", 0444, NULL, NULL,
 			    &wakeup_sources_stats_fops);
+	wakeup_sources_bpf_init();
+
 	return 0;
 }
 
-postcore_initcall(wakeup_sources_debugfs_init);
+postcore_initcall(wakeup_sources_init);

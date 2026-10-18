@@ -31,6 +31,7 @@ phys_addr_t pvmfw_size;
 			 (unsigned long)__per_cpu_start)
 
 u64 hyp_lm_size_mb;
+u64 kvm_ffa_spm_nr_pages = KVM_FFA_SPM_HANDLE_NR_PAGES;
 
 static void *vmemmap_base;
 static void *vm_table_base;
@@ -310,6 +311,16 @@ static int fix_host_ownership(void)
 			return ret;
 	}
 
+	/* The stacks sit in the private VA range, not the linear map. */
+	for (i = 0; i < hyp_nr_cpus; i++) {
+		struct kvm_nvhe_init_params *params = per_cpu_ptr(&kvm_init_params, i);
+		u64 start = params->stack_hyp_va - NVHE_STACK_SIZE;
+
+		ret = kvm_pgtable_walk(&pkvm_pgtable, start, NVHE_STACK_SIZE, &walker);
+		if (ret)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -332,11 +343,24 @@ static int unmap_protected_regions(void)
 
 	for (i = 0; i < pkvm_moveable_regs_nr; i++) {
 		reg = &pkvm_moveable_regs[i];
-		if (reg->type != PKVM_MREG_PROTECTED_RANGE)
-			continue;
 
-		ret = host_stage2_set_owner_locked(reg->start, reg->size,
-						   PKVM_ID_PROTECTED);
+		switch (reg->type) {
+		case PKVM_MREG_PROTECTED_RANGE:
+			ret = host_stage2_set_owner_locked(
+				reg->start, reg->size, PKVM_ID_PROTECTED);
+			break;
+		case PKVM_MREG_EMULATE_MMIO:
+			ret = ___pkvm_host_donate_hyp_prot(
+				reg->start >> PAGE_SHIFT,
+				reg->size >> PAGE_SHIFT, true, PAGE_HYP_DEVICE);
+
+			if (reg->cb)
+				reg->cb = kern_hyp_va(reg->cb);
+			break;
+		default:
+			continue;
+		}
+
 		if (ret)
 			return ret;
 	}
@@ -395,6 +419,10 @@ void __noreturn __pkvm_init_finalise(void)
 		goto out;
 
 	ret = pin_host_tables();
+	if (ret)
+		goto out;
+
+	ret = fix_host_ownership();
 	if (ret)
 		goto out;
 

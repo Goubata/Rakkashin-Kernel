@@ -258,6 +258,7 @@ struct kvm_s2_mmu {
 };
 
 struct kvm_arch_memory_slot {
+	u64 pkvm_pf_count;
 };
 
 /**
@@ -278,7 +279,10 @@ struct kvm_pinned_page {
 		struct rb_node	 	node;
 		struct list_head 	list_node;
 	};
-	struct page		*page;
+	struct page		*_page;
+	struct file		*file;
+	struct kvm_memory_slot	*slot;
+	u64			pfn;
 	u64			ipa;
 	u64			__subtree_last;
 	u8			order;
@@ -290,6 +294,8 @@ struct kvm_pinned_page
 *kvm_pinned_pages_iter_next(struct kvm_pinned_page *ppage, u64 start, u64 end);
 void kvm_pinned_pages_remove(struct kvm_pinned_page *ppage,
 			     struct rb_root_cached *root);
+
+void pkvm_release_ppage(struct kvm_pinned_page *ppage, bool dirty);
 
 typedef unsigned int pkvm_handle_t;
 
@@ -687,11 +693,19 @@ struct kvm_host_data {
 		struct kvm_guest_debug_arch regs;
 		/* Statistical profiling extension */
 		u64 pmscr_el1;
+		u64 pmblimitr_el1;
 		/* Self-hosted trace */
 		u64 trfcr_el1;
+		u64 trblimitr_el1;
 		/* Values of trap registers for the host before guest entry. */
 		u64 mdcr_el2;
 	} host_debug_state;
+};
+
+enum kvm_psci_mem_protect_mode {
+	KVM_PSCI_MEM_PROTECT_AUTO,	/* Probe capabilities and call if supported */
+	KVM_PSCI_MEM_PROTECT_FORCE,	/* Enforce PSCI MEM_PROTECT handling */
+	KVM_PSCI_MEM_PROTECT_OFF,	/* Skip PSCI MEM_PROTECT handling */
 };
 
 struct kvm_host_psci_config {
@@ -707,6 +721,9 @@ struct kvm_host_psci_config {
 	bool psci_0_1_cpu_off_implemented;
 	bool psci_0_1_migrate_implemented;
 };
+
+extern enum kvm_psci_mem_protect_mode kvm_nvhe_sym(kvm_psci_mem_protect_mode);
+#define kvm_psci_mem_protect_mode CHOOSE_NVHE_SYM(kvm_psci_mem_protect_mode)
 
 extern struct kvm_host_psci_config kvm_nvhe_sym(kvm_host_psci_config);
 #define kvm_host_psci_config CHOOSE_NVHE_SYM(kvm_host_psci_config)
@@ -1604,7 +1621,7 @@ static inline bool __vcpu_has_feature(const struct kvm_arch *ka, int feature)
 #define kvm_vcpu_has_feature(k, f)	__vcpu_has_feature(&(k)->arch, (f))
 #define vcpu_has_feature(v, f)	__vcpu_has_feature(&(v)->kvm->arch, (f))
 
-#define kvm_vcpu_initialized(v) vcpu_get_flag(vcpu, VCPU_INITIALIZED)
+#define kvm_vcpu_initialized(v) vcpu_get_flag(v, VCPU_INITIALIZED)
 
 int kvm_trng_call(struct kvm_vcpu *vcpu);
 #ifdef CONFIG_KVM
@@ -1718,7 +1735,9 @@ struct kvm_iommu_driver {
 				   pkvm_handle_t *out_iommu, u32 *out_sid);
 	void *(*guest_alloc)(void *flags, unsigned long order);
 	void (*guest_free)(void *addr, void *flags, unsigned long order);
-	ANDROID_KABI_RESERVE(1);
+	ANDROID_KABI_USE(
+		1, int (*get_iommu_endpoint)(struct of_phandle_args *iommu_spec,
+					     u64 *out_endpoint));
 	ANDROID_KABI_RESERVE(2);
 	ANDROID_KABI_RESERVE(3);
 	ANDROID_KABI_RESERVE(4);
@@ -1735,6 +1754,7 @@ int kvm_iommu_init_hyp(struct kvm_iommu_ops *hyp_ops,
 int kvm_iommu_init_driver(void);
 void kvm_iommu_remove_driver(void);
 pkvm_handle_t kvm_get_iommu_id_by_of(struct device_node *np);
+int kvm_get_iommu_endpoint(struct of_phandle_args *iommu_spec, u64 *out_endpoint);
 
 struct page *kvm_iommu_cma_alloc(void);
 bool kvm_iommu_cma_release(struct page *p);
