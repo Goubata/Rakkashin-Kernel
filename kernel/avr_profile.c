@@ -230,6 +230,10 @@ static unsigned long fas_seen;			/* jiffies of the last timed frame */
 static unsigned int fas_cut = FAS_CUT_START;	/* headroom trim, points */
 static unsigned int fas_clean_ticks;
 static uid_t top_uid = NO_UID;			/* UID of top_pid */
+static uid_t frame_uid = NO_UID;		/* UID whose frames are being timed */
+static uid_t frame_cand = NO_UID;		/* a new one, not yet confirmed */
+static unsigned int frame_cand_n;
+#define FRAME_UID_CONFIRM	30	/* frames before the learned state switches */
 static uid_t mem_uid = NO_UID;			/* UID whose state is live */
 #define APP_MEMORY		8
 static struct {
@@ -960,7 +964,7 @@ static void gov_fn(struct work_struct *work)
 	mutex_lock(&avr_lock);
 	if (READ_ONCE(fas_reset)) {
 		WRITE_ONCE(fas_reset, false);
-		app_mem_switch(READ_ONCE(top_uid));
+		app_mem_switch(READ_ONCE(frame_uid));
 	}
 	if (tmeasure) {
 		skin_mc = temp;
@@ -1050,9 +1054,28 @@ static void smart_drop_fn(struct work_struct *work)
 void avr_profile_frame_seen(void)
 {
 	unsigned long now = jiffies;
+	uid_t uid = from_kuid(&init_user_ns, current_uid());
 
 	if (READ_ONCE(fas_seen) != now)
 		WRITE_ONCE(fas_seen, now);
+	/*
+	 * The app that actually draws decides whose learned state is live, not
+	 * whatever joined top-app last (a bound ad service, a shell child).
+	 * Racy counters are fine: one drawing app at a time in practice.
+	 */
+	if (likely(uid == READ_ONCE(frame_uid)))
+		return;
+	if (uid != READ_ONCE(frame_cand)) {
+		WRITE_ONCE(frame_cand, uid);
+		WRITE_ONCE(frame_cand_n, 0);
+		return;
+	}
+	if (READ_ONCE(frame_cand_n) + 1 >= FRAME_UID_CONFIRM) {
+		WRITE_ONCE(frame_uid, uid);
+		WRITE_ONCE(fas_reset, true);
+	} else {
+		WRITE_ONCE(frame_cand_n, READ_ONCE(frame_cand_n) + 1);
+	}
 }
 
 /*
@@ -1246,7 +1269,6 @@ void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 	    task->tgid != READ_ONCE(top_pid)) {
 		WRITE_ONCE(top_pid, task->tgid);
 		WRITE_ONCE(top_uid, uid);
-		WRITE_ONCE(fas_reset, true);	/* its floors were another app's */
 		queue_work(system_unbound_wq, &top_pid_work);
 	}
 
