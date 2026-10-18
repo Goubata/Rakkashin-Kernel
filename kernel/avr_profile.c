@@ -100,7 +100,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.0.1 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.0.2 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -407,6 +407,8 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 	unsigned int fmax = policy->cpuinfo.max_freq;
 	unsigned int khz = READ_ONCE(policy->cur);
 	bool touched = smart_lifted;
+	/* the cap is in force (untouched, or touched with Sustained engaged) */
+	bool applied = !touched || sustained_engaged();
 	/* never below the most efficient OPP (clamped to a sane share of max) */
 	s32 floor = max_t(s32, pct_of(fmax, DEMAND_FLOOR_PCT),
 			  min_t(s32, efficient_khz(policy), pct_of(fmax, 60)));
@@ -429,9 +431,14 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 		/* fresh start: never ran at a cap yet */
 		r->bound_age = UINT_MAX;
 		r->sat_age = UINT_MAX;
-	} else if (r->dcap < (s32)fmax && cur <= (s32)READ_ONCE(policy->max) &&
+	} else if (applied && r->dcap < (s32)fmax && cur <= (s32)READ_ONCE(policy->max) &&
 		   (u64)khz * 100 >= (u64)cur * 95) {
-		/* our cap (not thermal or another limit) is what the CPUs ran into */
+		/*
+		 * Our cap (not thermal or another limit) is what the CPUs ran
+		 * into. Only while it is applied: while touched with Sustained
+		 * still cool, dcap is tracked but not in force, and a CPU above
+		 * it is simply running free.
+		 */
 		r->bound_age = 0;
 	} else if (r->bound_age < UINT_MAX) {
 		r->bound_age++;
@@ -467,7 +474,7 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 			   min_t(unsigned int, headroom, FAS_HEADROOM_MIN);
 	want = clamp_t(s32, need * (100 + headroom) / 100, floor, fmax);
 
-	if (saturated && r->bound_age == 0)
+	if (saturated && applied && r->bound_age == 0)
 		r->sat_age = 0;
 	else if (r->sat_age < UINT_MAX)
 		r->sat_age++;
