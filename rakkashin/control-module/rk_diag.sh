@@ -78,6 +78,11 @@ echo "top app: $(tr '\0' ' ' < "/proc/$TP/cmdline" 2>/dev/null | cut -c1-80) (pi
 echo "libgui probed: inode $(stat -c '%i' /system/lib64/libgui.so 2>&1)"
 echo "libgui in top app: $(grep -m3 'libgui' "/proc/$TP/maps" 2>/dev/null | awk '{print "inode", $5, $6}' | sort -u | tr '\n' ' ')"
 
+echo "== core_ctl (min_cpus active_cpus need_cpus)"
+for d in /sys/devices/system/cpu/cpu*/core_ctl; do
+	echo "$d $(cat "$d/min_cpus" "$d/active_cpus" "$d/need_cpus" 2>/dev/null | tr '\n' ' ')"
+done
+
 echo "== cpufreq"
 for p in /sys/devices/system/cpu/cpufreq/policy*; do
 	echo "$p cur=$(cat "$p/scaling_cur_freq") min=$(cat "$p/scaling_min_freq") max=$(cat "$p/scaling_max_freq") hw=$(cat "$p/cpuinfo_max_freq")"

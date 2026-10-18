@@ -34,7 +34,9 @@
  * Smart Balanced: in balanced, CPUs are capped at smart_cap percent of max
  * (default 80) while nobody touches the screen, and the cap is lifted the
  * moment a touch event arrives (in-kernel input handler) or an app launches,
- * held for SMART_HOLD_MS after the last touch. The top of the frequency
+ * held for SMART_HOLD_MS after the last touch (WAKE_HOLD_MS after the power
+ * key, so waking the phone and the unlock animation before the first touch
+ * aren't capped). The top of the frequency
  * range is where energy per unit of work is worst; this trims it during
  * passive use (reading, video, background work) without touching interactive
  * performance. smart_cap=100 restores plain balanced.
@@ -100,7 +102,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.0.2 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.1 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -179,6 +181,8 @@ static bool applied;				/* a mode was applied at least once */
 
 /* Smart Balanced state */
 #define SMART_HOLD_MS	1000
+#define WAKE_HOLD_MS	2000	/* caps stay lifted this long after the power key */
+static unsigned long wake_until;		/* jiffies; lifted at least until then */
 static unsigned int smart_cap = 80;		/* % of max while idle; 100 = off */
 /*
  * Sustained performance: keep the demand-matched caps (CPU here, GPU in
@@ -1056,9 +1060,14 @@ static void smart_drop_fn(struct work_struct *work)
 {
 	unsigned long hold = msecs_to_jiffies(SMART_HOLD_MS);
 	unsigned long since = jiffies - READ_ONCE(last_kick);
+	unsigned long wake = READ_ONCE(wake_until);
 
 	if (since < hold) {
 		mod_delayed_work(system_unbound_wq, &smart_drop_work, hold - since);
+		return;
+	}
+	if (time_before(jiffies, wake)) {
+		mod_delayed_work(system_unbound_wq, &smart_drop_work, wake - jiffies);
 		return;
 	}
 
@@ -1136,6 +1145,10 @@ static void smart_input_event(struct input_handle *handle, unsigned int type,
 		if (unlikely(!READ_ONCE(smart_armed)))
 			WRITE_ONCE(smart_armed, true);
 		avr_profile_kick();
+	} else if (type == EV_KEY && code == KEY_POWER && value == 1) {
+		/* waking up: lift for the unlock before anything is touched */
+		WRITE_ONCE(wake_until, jiffies + msecs_to_jiffies(WAKE_HOLD_MS));
+		avr_profile_kick();
 	}
 }
 
@@ -1182,6 +1195,11 @@ static const struct input_device_id smart_input_ids[] = {
 		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,
 		.evbit = { BIT_MASK(EV_ABS) },
 		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] = BIT_MASK(ABS_MT_POSITION_X) },
+	},
+	{	/* the power key (PMIC pwrkey, gpio-keys) */
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_KEYBIT,
+		.evbit = { BIT_MASK(EV_KEY) },
+		.keybit = { [BIT_WORD(KEY_POWER)] = BIT_MASK(KEY_POWER) },
 	},
 	{ },
 };

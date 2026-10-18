@@ -66,6 +66,34 @@ while read -r g k v; do setu "$g" "$k" "$v"; done < "$STATE/cg_defaults"
 
 if [ "$MODE" = extreme ]; then hw_extreme; else hw_restore; fi
 
+# core_ctl (Qualcomm WALT core control) pauses cores when a cluster is
+# lightly loaded. Its stock minimums are saved once; battery lets it pause
+# more of the efficiency cluster (down to 2 of 6 awake), balanced keeps the
+# stock behaviour, and the fast profiles keep every core awake so a burst
+# never waits for a paused core. (Vendor boosts may also write min_cpus.)
+CCSAVED=$STATE/core_ctl_defaults
+if [ ! -s "$CCSAVED" ]; then
+	for d in /sys/devices/system/cpu/cpu*/core_ctl; do
+		[ -r "$d/min_cpus" ] && echo "$d $(cat "$d/min_cpus") $(cat "$d/max_cpus")"
+	done > "$CCSAVED"
+fi
+core_ctl() {
+	while read -r d min max; do
+		[ -w "$d/min_cpus" ] || continue
+		case "$1" in
+		low)  [ "$min" -gt 2 ] && v=2 || v=$min ;;
+		all)  v=$max ;;
+		*)    v=$min ;;
+		esac
+		echo "$v" > "$d/min_cpus"
+	done < "$CCSAVED"
+}
+case "$MODE" in
+battery) core_ctl low ;;
+performance|game|extreme) core_ctl all ;;
+*) core_ctl stock ;;
+esac
+
 case "$MODE" in
 balanced)
 	# background work runs on lower, more efficient frequencies; the
