@@ -554,14 +554,18 @@ static void gov_tick(void)
 	g.nclk = 0;
 	g.work = busy * avg;
 
-	/* frequency the current work needs, plus headroom */
-	/* frames on time for another CUT_STEP_MS: a point less headroom */
-	if (frames_timed() && !fas.degraded && t - cut_since >= CUT_STEP_MS &&
-	    t - fas.last_jank >= CUT_STEP_MS) {
+	/*
+	 * Another CUT_STEP_MS without a cap-caused jank: a point less headroom.
+	 * cut_since restarts only when the GPU cap held a frame back
+	 * (gov_jank), so the game's own late frames don't stop the trim - the
+	 * same rule as the kernel's for the CPU.
+	 */
+	if (frames_timed() && !fas.degraded && t - cut_since >= CUT_STEP_MS) {
 		cut_since = t;
 		if (cut < CUT_MAX)
 			cut++;
 	}
+	/* frequency the current work needs, plus headroom */
 	want = step_for(avg * busy / 100 *
 			(100 + (touched ? touch_headroom(frames_timed()) :
 				idle_headroom(frames_timed()))) / 100);
