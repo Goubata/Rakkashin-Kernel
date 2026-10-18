@@ -39,6 +39,8 @@
 #endif
 
 #include "binder.c"
+#include "bitmap.c"
+#include "bitops.c"
 #include "blk.c"
 #include "bug.c"
 #include "build_assert.c"
@@ -52,9 +54,11 @@
 #include "mm.c"
 #include "mman.c"
 #include "mutex.c"
+#include "net/genetlink.c"
 #include "page.c"
 #include "pid_namespace.c"
 #include "poll.c"
+#include "ratelimit.c"
 #include "rbtree.c"
 #include "refcount.c"
 #include "security.c"

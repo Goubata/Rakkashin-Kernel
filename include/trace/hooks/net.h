@@ -2,7 +2,9 @@
 
 #undef TRACE_SYSTEM
 #define TRACE_SYSTEM net
+#ifdef CREATE_TRACE_POINTS
 #define TRACE_INCLUDE_PATH trace/hooks
+#endif
 
 #if !defined(_TRACE_HOOK_NET_VH_H) || defined(TRACE_HEADER_MULTI_READ)
 #define _TRACE_HOOK_NET_VH_H
@@ -17,12 +19,6 @@ enum tcp_state_change_reason {
 	TCP_STATE_CHANGE_REASON_RETRANSMIT
 };
 #endif
-
-struct packet_type;
-struct list_head;
-DECLARE_HOOK(android_vh_ptype_head,
-	TP_PROTO(const struct packet_type *pt, struct list_head *vendor_pt),
-	TP_ARGS(pt, vendor_pt));
 
 struct sock;
 struct sockaddr_in6;
@@ -129,6 +125,16 @@ DECLARE_HOOK(android_vh_udp_enqueue_schedule_skb,
 	TP_PROTO(struct sock *sk, struct sk_buff *skb), TP_ARGS(sk, skb));
 DECLARE_HOOK(android_vh_build_skb_around,
 	TP_PROTO(struct sk_buff *skb), TP_ARGS(skb));
+struct inet_frag_queue;
+DECLARE_HOOK(android_vh_reasm_timer_adjust,
+	TP_PROTO(struct inet_frag_queue *q, struct sk_buff *skb),
+	TP_ARGS(q, skb));
+DECLARE_HOOK(android_vh_netlink_alloc_skb,
+	TP_PROTO(unsigned int alloc_size, gfp_t gfp_mask, struct sk_buff **skb),
+	TP_ARGS(alloc_size, gfp_mask, skb));
+DECLARE_HOOK(android_vh_skb_free_head,
+	TP_PROTO(struct sk_buff *skb, bool *handled),
+	TP_ARGS(skb, handled));
 
 /* macro versions of hooks are no longer required */
 

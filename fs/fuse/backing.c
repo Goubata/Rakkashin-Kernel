@@ -15,7 +15,8 @@
 
 #include "../internal.h"
 
-#define FUSE_BPF_IOCB_MASK (IOCB_APPEND | IOCB_DSYNC | IOCB_HIPRI | IOCB_NOWAIT | IOCB_SYNC)
+#define FUSE_BPF_IOCB_MASK (IOCB_APPEND | IOCB_DSYNC | IOCB_HIPRI | IOCB_NOWAIT | IOCB_SYNC | \
+			    IOCB_DONTCACHE)
 
 struct fuse_bpf_aio_req {
 	struct kiocb iocb;
@@ -244,18 +245,21 @@ int fuse_create_open_backing(
 	backing_dentry = lookup_one_len(fa->in_args[1].value,
 					dir_fuse_dentry->backing_path.dentry,
 					strlen(fa->in_args[1].value));
-	inode_unlock(dir_fuse_inode->backing_inode);
 
-	if (IS_ERR(backing_dentry))
+	if (IS_ERR(backing_dentry)) {
+		inode_unlock(dir_fuse_inode->backing_inode);
 		return PTR_ERR(backing_dentry);
+	}
 
 	if (d_really_is_positive(backing_dentry)) {
+		inode_unlock(dir_fuse_inode->backing_inode);
 		err = -EIO;
 		goto out;
 	}
 
 	err = vfs_create(&nop_mnt_idmap, dir_fuse_inode->backing_inode,
 			 backing_dentry, fci->mode, true);
+	inode_unlock(dir_fuse_inode->backing_inode);
 	if (err)
 		goto out;
 
@@ -283,12 +287,11 @@ int fuse_create_open_backing(
 	fuse_entry->bpf = NULL;
 
 	newent = d_splice_alias(inode, entry);
+	inode = NULL;
 	if (IS_ERR(newent)) {
 		err = PTR_ERR(newent);
 		goto out;
 	}
-
-	inode = NULL;
 	entry = newent ? newent : entry;
 	err = finish_open(file, entry, fuse_open_file_backing);
 
@@ -812,10 +815,6 @@ int fuse_file_read_iter_initialize(
 		.size = to->count,
 	};
 
-	fri->frio = (struct fuse_read_iter_out) {
-		.ret = fri->fri.size,
-	};
-
 	/* TODO we can't assume 'to' is a kvec */
 	/* TODO we also can't assume the vector has only one component */
 	*fa = (struct fuse_bpf_args) {
@@ -850,11 +849,6 @@ int fuse_file_read_iter_backing(struct fuse_bpf_args *fa,
 	if (!iov_iter_count(to))
 		return 0;
 
-	if ((iocb->ki_flags & IOCB_DIRECT) &&
-	    (!ff->backing_file->f_mapping->a_ops ||
-	     !ff->backing_file->f_mapping->a_ops->direct_IO))
-		return -EINVAL;
-
 	/* TODO This just plain ignores any change to fuse_read_in */
 	if (is_sync_kiocb(iocb)) {
 		ret = vfs_iter_read(ff->backing_file, to, &iocb->ki_pos,
@@ -877,14 +871,13 @@ int fuse_file_read_iter_backing(struct fuse_bpf_args *fa,
 			fuse_bpf_aio_cleanup_handler(aio_req);
 	}
 
-	frio->ret = ret;
-
 	/* TODO Need to point value at the buffer for post-modification */
 
 out:
 	fuse_file_accessed(file, ff->backing_file);
 
-	return ret;
+	frio->ret = ret;
+	return ret < 0 ? ret : 0;
 }
 
 void *fuse_file_read_iter_finalize(struct fuse_bpf_args *fa,
@@ -1055,14 +1048,10 @@ ssize_t fuse_backing_mmap(struct file *file, struct vm_area_struct *vma)
 	if (WARN_ON(file != vma->vm_file))
 		return -EIO;
 
-	vma->vm_file = get_file(backing_file);
-
+	vma_set_file(vma, backing_file);
 	ret = call_mmap(vma->vm_file, vma);
-
 	if (ret)
-		fput(backing_file);
-	else
-		fput(file);
+		return ret;
 
 	if (file->f_flags & O_NOATIME)
 		return ret;
@@ -1208,25 +1197,33 @@ int fuse_handle_backing(struct fuse_entry_bpf *feb, struct inode **backing_inode
 		/* backing inode/path are added in fuse_lookup_backing */
 		break;
 
-	case FUSE_ACTION_REMOVE:
-		iput(*backing_inode);
-		*backing_inode = NULL;
+	case FUSE_ACTION_REMOVE: {
+		struct inode *old_inode = NULL;
+
+		if (backing_inode)
+			old_inode = xchg(backing_inode, NULL);
+		iput(old_inode);
 		path_put(backing_path);
 		*backing_path = (struct path) { };
 		break;
+	}
 
 	case FUSE_ACTION_REPLACE: {
 		struct file *backing_file = feb->backing_file;
+		struct inode *new_inode;
+		struct inode *old_inode = NULL;
 
 		if (!backing_file)
 			return -EINVAL;
 		if (IS_ERR(backing_file))
 			return PTR_ERR(backing_file);
 
-		if (backing_inode)
-			iput(*backing_inode);
-		*backing_inode = backing_file->f_inode;
-		ihold(*backing_inode);
+		new_inode = backing_file->f_inode;
+		if (backing_inode) {
+			ihold(new_inode);
+			old_inode = xchg(backing_inode, new_inode);
+			iput(old_inode);
+		}
 
 		path_put(backing_path);
 		*backing_path = backing_file->f_path;
@@ -1346,8 +1343,7 @@ struct dentry *fuse_lookup_finalize(struct fuse_bpf_args *fa, struct inode *dir,
 
 		get_fuse_inode(inode)->nodeid = feo->nodeid;
 		ret = d_splice_alias(inode, entry);
-		if (!IS_ERR(ret))
-			inode = NULL;
+		inode = NULL;
 	}
 out:
 	iput(inode);
@@ -1456,7 +1452,7 @@ int fuse_mknod_backing(
 		 */
 		goto out;
 	}
-	inode = fuse_iget_backing(dir->i_sb, fuse_inode->nodeid, backing_inode);
+	inode = fuse_iget_backing(dir->i_sb, 0, d_inode(backing_path.dentry));
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
 		goto out;
@@ -1584,18 +1580,32 @@ int fuse_rmdir_backing(
 	struct path backing_path = {};
 	struct dentry *backing_parent_dentry;
 	struct inode *backing_inode;
-
-	/* TODO Actually deal with changing the backing entry in rmdir */
+	struct dentry *revalidated;
+	const char *name = fa->in_args[0].value;
 	get_fuse_backing_path(entry, &backing_path);
 	if (!backing_path.dentry)
 		return -EBADF;
 
-	/* TODO Not sure if we should reverify like overlayfs, or get inode from d_parent */
 	backing_parent_dentry = dget_parent(backing_path.dentry);
 	backing_inode = d_inode(backing_parent_dentry);
 
 	inode_lock_nested(backing_inode, I_MUTEX_PARENT);
+	/* Re-validate the backing entry under the parent lock to prevent races */
+	revalidated = lookup_one_len(name, backing_parent_dentry, strlen(name));
+	if (IS_ERR(revalidated)) {
+		err = PTR_ERR(revalidated);
+		goto out_unlock;
+	}
+	/* If the backing entry has changed or was already deleted, abort safely */
+	if (revalidated != backing_path.dentry) {
+		dput(revalidated);
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	dput(revalidated);
+
 	err = vfs_rmdir(&nop_mnt_idmap, backing_inode, backing_path.dentry);
+out_unlock:
 	inode_unlock(backing_inode);
 
 	dput(backing_parent_dentry);
@@ -1807,18 +1817,32 @@ int fuse_unlink_backing(
 	struct path backing_path = {};
 	struct dentry *backing_parent_dentry;
 	struct inode *backing_inode;
-
-	/* TODO Actually deal with changing the backing entry in unlink */
+	struct dentry *revalidated;
+	const char *name = fa->in_args[0].value;
 	get_fuse_backing_path(entry, &backing_path);
 	if (!backing_path.dentry)
 		return -EBADF;
 
-	/* TODO Not sure if we should reverify like overlayfs, or get inode from d_parent */
 	backing_parent_dentry = dget_parent(backing_path.dentry);
 	backing_inode = d_inode(backing_parent_dentry);
 
 	inode_lock_nested(backing_inode, I_MUTEX_PARENT);
+	/* Re-validate the backing entry under the parent lock to prevent races */
+	revalidated = lookup_one_len(name, backing_parent_dentry, strlen(name));
+	if (IS_ERR(revalidated)) {
+		err = PTR_ERR(revalidated);
+		goto out_unlock;
+	}
+	/* If the backing entry has changed or was already deleted, abort safely */
+	if (revalidated != backing_path.dentry) {
+		dput(revalidated);
+		err = -ENOENT;
+		goto out_unlock;
+	}
+	dput(revalidated);
+
 	err = vfs_unlink(&nop_mnt_idmap, backing_inode, backing_path.dentry, NULL);
+out_unlock:
 	inode_unlock(backing_inode);
 
 	dput(backing_parent_dentry);
@@ -1896,7 +1920,7 @@ int fuse_link_backing(struct fuse_bpf_args *fa, struct dentry *entry,
 		goto out;
 	}
 
-	fuse_new_inode = fuse_iget_backing(dir->i_sb, fuse_dir_inode->nodeid, backing_dir_inode);
+	fuse_new_inode = fuse_iget_backing(dir->i_sb, 0, d_inode(backing_new_path.dentry));
 	if (IS_ERR(fuse_new_inode)) {
 		err = PTR_ERR(fuse_new_inode);
 		goto out;
@@ -2015,13 +2039,16 @@ void *fuse_getattr_finalize(struct fuse_bpf_args *fa,
 	struct fuse_attr_out *outarg = fa->out_args[0].value;
 	struct inode *inode = entry->d_inode;
 	u64 attr_version = fuse_get_attr_version(get_fuse_mount(inode)->fc);
-	int err = 0;
 
-	/* TODO: Ensure this doesn't happen if we had an error getting attrs in
-	 * backing.
+	/*
+	 * If backing getattr returned an error (such as a transient -ENOENT or
+	 * -ESTALE), do not pass uninitialized/zeroed attributes to finalize_attr,
+	 * as fuse_invalid_attr() will permanently mark the inode bad (FUSE_I_BAD).
 	 */
-	err = finalize_attr(inode, outarg, attr_version, stat);
-	return ERR_PTR(err);
+	if (fa->error_in)
+		return ERR_PTR(fa->error_in);
+
+	return ERR_PTR(finalize_attr(inode, outarg, attr_version, stat));
 }
 
 static void fattr_to_iattr(struct fuse_conn *fc,
@@ -2287,7 +2314,7 @@ int fuse_symlink_backing(
 		 */
 		goto out;
 	}
-	inode = fuse_iget_backing(dir->i_sb, fuse_inode->nodeid, backing_inode);
+	inode = fuse_iget_backing(dir->i_sb, 0, d_inode(backing_path.dentry));
 	if (IS_ERR(inode)) {
 		err = PTR_ERR(inode);
 		goto out;

@@ -173,3 +173,10 @@ static inline void device_pm_init(struct device *dev)
 struct wakeup_source;
 extern bool boeffla_wl_blocked(struct wakeup_source *ws);
 #endif
+
+#ifdef CONFIG_BPF_SYSCALL
+struct bpf_ws_lock { };
+struct bpf_ws_lock *bpf_wakeup_sources_read_lock(void);
+void bpf_wakeup_sources_read_unlock(struct bpf_ws_lock *lock);
+void *bpf_wakeup_sources_get_head(void);
+#endif

@@ -28,7 +28,7 @@ config ANDROID_BINDERFS
 
 config ANDROID_BINDER_DEVICES
 	string "Android Binder devices"
-	depends on ANDROID_BINDER_IPC
+	depends on ANDROID_BINDER_IPC || ANDROID_BINDER_IPC_RUST
 	default "binder,hwbinder,vndbinder"
 	help
 	  Default value for the binder.devices parameter.
@@ -104,5 +104,24 @@ config ANDROID_VENDOR_OEM_DATA
 	  NOT be supported by the Google Android kernel team.
 
 	  If even slightly unsure, say Y.
+
+config ANDROID_WRAPFD
+	bool "WrapFD Driver"
+	depends on MMU
+	help
+	  Enable WrapFD driver to control ability to map a file
+
+	  WrapFD allows wrapping an fd representing a memory buffer into a new
+	  file supporting ioctl API for file ownership that controls ability to
+	  map the file.
+
+config GUEST_DMA_PROXY
+	tristate "Guest DMA-Buf Proxy Driver"
+	select DMA_SHARED_BUFFER
+	help
+	  This driver provides an ioctl interface for guest userspace to convert
+	  hypervisor-injected physical address ranges (e.g., from host shared memory)
+	  into standard dma-buf file descriptors.
+	  Say Y or M here if building a kernel for Microdroid or guest pVMs.
 
 endmenu

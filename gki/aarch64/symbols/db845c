@@ -941,6 +941,7 @@
   __wake_up
   __warn_printk
   watchdog_init_timeout
+  watchdog_notify_pretimeout
   ww_mutex_lock
   ww_mutex_lock_interruptible
   ww_mutex_unlock
@@ -2090,6 +2091,7 @@
   device_find_child
 
 # required by smem.ko
+  devm_hwspin_lock_request_specific
   hwspin_lock_bust
   hwspin_lock_free
   hwspin_lock_request_specific

@@ -68,6 +68,7 @@
 #include <net/sock.h>
 #include <net/scm.h>
 #include <net/netlink.h>
+#include <trace/hooks/net.h>
 #define CREATE_TRACE_POINTS
 #include <trace/events/netlink.h>
 
@@ -1477,9 +1478,14 @@ static void do_one_broadcast(struct sock *sk,
 		p->skb2 = NULL;
 		goto out;
 	}
-	NETLINK_CB(p->skb2).nsid = peernet2id(sock_net(sk), p->net);
-	if (NETLINK_CB(p->skb2).nsid != NETNSA_NSID_NOT_ASSIGNED)
-		NETLINK_CB(p->skb2).nsid_is_set = true;
+
+	NETLINK_CB(p->skb2).nsid_is_set = false;
+	if (!net_eq(sock_net(sk), p->net)) {
+		NETLINK_CB(p->skb2).nsid = peernet2id(sock_net(sk), p->net);
+		if (NETLINK_CB(p->skb2).nsid != NETNSA_NSID_NOT_ASSIGNED)
+			NETLINK_CB(p->skb2).nsid_is_set = true;
+	}
+
 	val = netlink_broadcast_deliver(sk, p->skb2);
 	if (val < 0) {
 		netlink_overrun(sk);
@@ -2275,10 +2281,13 @@ static int netlink_dump(struct sock *sk, bool lock_taken)
 
 	max_recvmsg_len = READ_ONCE(nlk->max_recvmsg_len);
 	if (alloc_min_size < max_recvmsg_len) {
+		gfp_t gfp_mask = (GFP_KERNEL & ~__GFP_DIRECT_RECLAIM) |
+				__GFP_NOWARN | __GFP_NORETRY;
+
 		alloc_size = max_recvmsg_len;
-		skb = alloc_skb(alloc_size,
-				(GFP_KERNEL & ~__GFP_DIRECT_RECLAIM) |
-				__GFP_NOWARN | __GFP_NORETRY);
+		trace_android_vh_netlink_alloc_skb(alloc_size, gfp_mask, &skb);
+		if (!skb)
+			skb = alloc_skb(alloc_size, gfp_mask);
 	}
 	if (!skb) {
 		alloc_size = alloc_min_size;

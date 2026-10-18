@@ -847,7 +847,13 @@ static const struct file_operations proc_single_file_operations = {
 	.release	= single_release,
 };
 
-
+/*
+ * proc_mem_open() can return errno, NULL or mm_struct*.
+ *
+ *   - Returns NULL if the task has no mm (PF_KTHREAD or PF_EXITING)
+ *   - Returns mm_struct* on success
+ *   - Returns error code on failure
+ */
 struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
 {
 	struct task_struct *task = get_proc_task(inode);
@@ -872,8 +878,8 @@ static int __mem_open(struct inode *inode, struct file *file, unsigned int mode)
 {
 	struct mm_struct *mm = proc_mem_open(inode, mode);
 
-	if (IS_ERR(mm))
-		return PTR_ERR(mm);
+	if (IS_ERR_OR_NULL(mm))
+		return mm ? PTR_ERR(mm) : -ESRCH;
 
 	file->private_data = mm;
 	return 0;
@@ -3341,6 +3347,9 @@ static int proc_stack_depth(struct seq_file *m, struct pid_namespace *ns,
 static struct task_dma_buf_info *get_task_dmabuf_info(struct task_struct *task)
 {
 	struct task_dma_buf_info *dmabuf_info;
+
+	if (!is_dmabuf_accounting_enabled())
+		return NULL;
 
 	task_lock(task);
 	dmabuf_info = task->dmabuf_info;

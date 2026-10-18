@@ -6,6 +6,7 @@
  */
 #include <linux/page_size_compat_defs.h>
 #include <linux/trace_recursion.h>
+#include <linux/panic_notifier.h>
 #include <linux/trace_events.h>
 #include <linux/ring_buffer.h>
 #include <linux/trace_clock.h>
@@ -30,8 +31,10 @@
 #include <linux/oom.h>
 #include <linux/mm.h>
 
+#include <asm/ring_buffer.h>
 #include <asm/local64.h>
 #include <asm/local.h>
+#include <asm/setup.h>
 
 #include "trace.h"
 
@@ -49,9 +52,12 @@ static void update_pages_handler(struct work_struct *work);
 
 struct ring_buffer_meta {
 	int		magic;
-	int		struct_size;
-	unsigned long	text_addr;
-	unsigned long	data_addr;
+	int		struct_sizes;
+	unsigned long	total_size;
+	unsigned long	buffers_offset;
+};
+
+struct ring_buffer_cpu_meta {
 	unsigned long	first_buffer;
 	unsigned long	head_buffer;
 	unsigned long	commit_buffer;
@@ -363,6 +369,23 @@ static __always_inline unsigned int rb_page_commit(struct buffer_page *bpage)
 	return local_read(&bpage->page->commit);
 }
 
+/* Size is determined by what has been committed */
+static __always_inline unsigned int rb_page_size(struct buffer_page *bpage)
+{
+	return rb_page_commit(bpage) & ~RB_MISSED_MASK;
+}
+
+/**
+ * rb_page_capacity - Get the capacity of a buffer page
+ * @bpage:	The buffer page
+ *
+ * Return: The maximum size available for events in the given buffer page.
+ */
+static __always_inline unsigned int rb_page_capacity(struct buffer_page *bpage)
+{
+	return (PAGE_SIZE << bpage->order) - BUF_PAGE_HDR_SIZE;
+}
+
 static void free_buffer_page(struct buffer_page *bpage)
 {
 	/* Range pages are not to be freed */
@@ -483,7 +506,7 @@ struct ring_buffer_per_cpu {
 	struct mutex			mapping_lock;
 	unsigned long			*subbuf_ids;	/* ID to subbuf VA */
 	struct trace_buffer_meta	*meta_page;
-	struct ring_buffer_meta		*ring_meta;
+	struct ring_buffer_cpu_meta	*ring_meta;
 
 	struct ring_buffer_writer	*writer;
 
@@ -519,14 +542,45 @@ struct trace_buffer {
 
 	unsigned long			range_addr_start;
 	unsigned long			range_addr_end;
+	struct notifier_block		flush_nb;
 
-	long				last_text_delta;
-	long				last_data_delta;
+	struct ring_buffer_meta		*meta;
 
-	unsigned int			subbuf_size;
 	unsigned int			subbuf_order;
 	unsigned int			max_data_size;
 };
+
+static __always_inline unsigned int rb_subbuf_size(struct trace_buffer *buffer)
+{
+	return PAGE_SIZE << buffer->subbuf_order;
+}
+
+/**
+ * rb_subbuf_capacity - Get the capacity of a subbuffer
+ * @buffer:	A trace buffer
+ *
+ * Unsafe to use without holding trace_buffer::mutex or with resizing enabled.
+ * Consider rb_page_capacity() instead.
+ *
+ * Return: The maximum size available for events in a trace buffer subbuffer.
+ */
+static __always_inline unsigned int rb_subbuf_capacity(struct trace_buffer *buffer)
+{
+	return rb_subbuf_size(buffer) - BUF_PAGE_HDR_SIZE;
+}
+
+/**
+ * rb_subbuf_start - Get the start address of a subbuffer
+ * @buffer:	A trace buffer
+ * @addr:	An address of an event on a subbuffer
+ *
+ * Return: The start of the subbuffer for where @addr sits
+ */
+static __always_inline
+unsigned long rb_subbuf_start(struct trace_buffer *buffer, unsigned long addr)
+{
+	return addr & ~((unsigned long)(rb_subbuf_size(buffer) - 1));
+}
 
 struct ring_buffer_iter {
 	struct ring_buffer_per_cpu	*cpu_buffer;
@@ -567,7 +621,7 @@ int ring_buffer_print_page_header(struct trace_buffer *buffer, struct trace_seq 
 	trace_seq_printf(s, "\tfield: char data;\t"
 			 "offset:%u;\tsize:%u;\tsigned:%u;\n",
 			 (unsigned int)offsetof(typeof(field), data),
-			 (unsigned int)buffer->subbuf_size,
+			 (unsigned int)rb_subbuf_capacity(buffer),
 			 (unsigned int)is_signed_type(char));
 
 	return !trace_seq_has_overflowed(s);
@@ -1241,7 +1295,7 @@ static void rb_head_page_activate(struct ring_buffer_per_cpu *cpu_buffer)
 	rb_set_list_to_head(head->list.prev);
 
 	if (cpu_buffer->ring_meta) {
-		struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+		struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 		meta->head_buffer = (unsigned long)head->page;
 	}
 }
@@ -1321,6 +1375,13 @@ static int rb_head_page_set_normal(struct ring_buffer_per_cpu *cpu_buffer,
 static inline void rb_inc_page(struct buffer_page **bpage)
 {
 	struct list_head *p = rb_list_head((*bpage)->list.next);
+
+	*bpage = list_entry(p, struct buffer_page, list);
+}
+
+static inline void rb_dec_page(struct buffer_page **bpage)
+{
+	struct list_head *p = rb_list_head((*bpage)->list.prev);
 
 	*bpage = list_entry(p, struct buffer_page, list);
 }
@@ -1539,7 +1600,7 @@ out_locked:
 static unsigned long
 rb_range_align_subbuf(unsigned long addr, int subbuf_size, int nr_subbufs)
 {
-	addr += sizeof(struct ring_buffer_meta) +
+	addr += sizeof(struct ring_buffer_cpu_meta) +
 		sizeof(int) * nr_subbufs;
 	return ALIGN(addr, subbuf_size);
 }
@@ -1549,20 +1610,23 @@ rb_range_align_subbuf(unsigned long addr, int subbuf_size, int nr_subbufs)
  */
 static void *rb_range_meta(struct trace_buffer *buffer, int nr_pages, int cpu)
 {
-	int subbuf_size = buffer->subbuf_size + BUF_PAGE_HDR_SIZE;
-	unsigned long ptr = buffer->range_addr_start;
-	struct ring_buffer_meta *meta;
+	int subbuf_size = rb_subbuf_size(buffer);
+	struct ring_buffer_cpu_meta *meta;
+	struct ring_buffer_meta *bmeta;
+	unsigned long ptr;
 	int nr_subbufs;
 
-	if (!ptr)
+	bmeta = buffer->meta;
+	if (!bmeta)
 		return NULL;
+
+	ptr = (unsigned long)bmeta + bmeta->buffers_offset;
+	meta = (struct ring_buffer_cpu_meta *)ptr;
 
 	/* When nr_pages passed in is zero, the first meta has already been initialized */
 	if (!nr_pages) {
-		meta = (struct ring_buffer_meta *)ptr;
 		nr_subbufs = meta->nr_subbufs;
 	} else {
-		meta = NULL;
 		/* Include the reader page */
 		nr_subbufs = nr_pages + 1;
 	}
@@ -1594,7 +1658,7 @@ static void *rb_range_meta(struct trace_buffer *buffer, int nr_pages, int cpu)
 }
 
 /* Return the start of subbufs given the meta pointer */
-static void *rb_subbufs_from_meta(struct ring_buffer_meta *meta)
+static void *rb_subbufs_from_meta(struct ring_buffer_cpu_meta *meta)
 {
 	int subbuf_size = meta->subbuf_size;
 	unsigned long ptr;
@@ -1610,7 +1674,7 @@ static void *rb_subbufs_from_meta(struct ring_buffer_meta *meta)
  */
 static void *rb_range_buffer(struct ring_buffer_per_cpu *cpu_buffer, int idx)
 {
-	struct ring_buffer_meta *meta;
+	struct ring_buffer_cpu_meta *meta;
 	unsigned long ptr;
 	int subbuf_size;
 
@@ -1636,17 +1700,79 @@ static void *rb_range_buffer(struct ring_buffer_per_cpu *cpu_buffer, int idx)
 }
 
 /*
+ * See if the existing memory contains a valid meta section.
+ * if so, use that, otherwise initialize it.
+ */
+static bool rb_meta_init(struct trace_buffer *buffer, int scratch_size)
+{
+	unsigned long ptr = buffer->range_addr_start;
+	struct ring_buffer_meta *bmeta;
+	unsigned long total_size;
+	int struct_sizes;
+
+	bmeta = (struct ring_buffer_meta *)ptr;
+	buffer->meta = bmeta;
+
+	total_size = buffer->range_addr_end - buffer->range_addr_start;
+
+	struct_sizes = sizeof(struct ring_buffer_cpu_meta);
+	struct_sizes |= sizeof(*bmeta) << 16;
+
+	/* The first buffer will start word size after the meta page */
+	ptr += sizeof(*bmeta);
+	ptr = ALIGN(ptr, sizeof(long));
+	ptr += scratch_size;
+
+	if (bmeta->magic != RING_BUFFER_META_MAGIC) {
+		pr_info("Ring buffer boot meta mismatch of magic\n");
+		goto init;
+	}
+
+	if (bmeta->struct_sizes != struct_sizes) {
+		pr_info("Ring buffer boot meta mismatch of struct size\n");
+		goto init;
+	}
+
+	if (bmeta->total_size != total_size) {
+		pr_info("Ring buffer boot meta mismatch of total size\n");
+		goto init;
+	}
+
+	if (bmeta->buffers_offset > bmeta->total_size) {
+		pr_info("Ring buffer boot meta mismatch of offset outside of total size\n");
+		goto init;
+	}
+
+	if (bmeta->buffers_offset != (void *)ptr - (void *)bmeta) {
+		pr_info("Ring buffer boot meta mismatch of first buffer offset\n");
+		goto init;
+	}
+
+	return true;
+
+ init:
+	bmeta->magic = RING_BUFFER_META_MAGIC;
+	bmeta->struct_sizes = struct_sizes;
+	bmeta->total_size = total_size;
+	bmeta->buffers_offset = (void *)ptr - (void *)bmeta;
+
+	/* Zero out the scatch pad */
+	memset((void *)bmeta + sizeof(*bmeta), 0, bmeta->buffers_offset - sizeof(*bmeta));
+
+	return false;
+}
+
+/*
  * See if the existing memory contains valid ring buffer data.
  * As the previous kernel must be the same as this kernel, all
  * the calculations (size of buffers and number of buffers)
  * must be the same.
  */
-static bool rb_meta_valid(struct ring_buffer_meta *meta, int cpu,
-			  struct trace_buffer *buffer, int nr_pages,
-			  unsigned long *subbuf_mask)
+static bool rb_cpu_meta_valid(struct ring_buffer_cpu_meta *meta, int cpu,
+			      struct trace_buffer *buffer, int nr_pages,
+			      unsigned long *subbuf_mask)
 {
 	int subbuf_size = PAGE_SIZE;
-	struct buffer_data_page *subbuf;
 	unsigned long buffers_start;
 	unsigned long buffers_end;
 	int i;
@@ -1654,17 +1780,8 @@ static bool rb_meta_valid(struct ring_buffer_meta *meta, int cpu,
 	if (!subbuf_mask)
 		return false;
 
-	/* Check the meta magic and meta struct size */
-	if (meta->magic != RING_BUFFER_META_MAGIC ||
-	    meta->struct_size != sizeof(*meta)) {
-		pr_info("Ring buffer boot meta[%d] mismatch of magic or struct size\n", cpu);
-		return false;
-	}
-
-	/* The subbuffer's size and number of subbuffers must match */
-	if (meta->subbuf_size != subbuf_size ||
-	    meta->nr_subbufs != nr_pages + 1) {
-		pr_info("Ring buffer boot meta [%d] mismatch of subbuf_size/nr_pages\n", cpu);
+	if (meta->subbuf_size != PAGE_SIZE) {
+		pr_info("Ring buffer boot meta [%d] invalid subbuf_size\n", cpu);
 		return false;
 	}
 
@@ -1684,20 +1801,16 @@ static bool rb_meta_valid(struct ring_buffer_meta *meta, int cpu,
 		return false;
 	}
 
-	subbuf = rb_subbufs_from_meta(meta);
-
 	bitmap_clear(subbuf_mask, 0, meta->nr_subbufs);
 
-	/* Is the meta buffers and the subbufs themselves have correct data? */
+	/*
+	 * Ensure the meta::buffers array has correct data. The data in each subbufs
+	 * are checked later in rb_meta_validate_events().
+	 */
 	for (i = 0; i < meta->nr_subbufs; i++) {
 		if (meta->buffers[i] < 0 ||
 		    meta->buffers[i] >= meta->nr_subbufs) {
 			pr_info("Ring buffer boot meta [%d] array out of range\n", cpu);
-			return false;
-		}
-
-		if ((unsigned)local_read(&subbuf->commit) > subbuf_size) {
-			pr_info("Ring buffer boot meta [%d] buffer invalid commit\n", cpu);
 			return false;
 		}
 
@@ -1707,13 +1820,12 @@ static bool rb_meta_valid(struct ring_buffer_meta *meta, int cpu,
 		}
 
 		set_bit(meta->buffers[i], subbuf_mask);
-		subbuf = (void *)subbuf + subbuf_size;
 	}
 
 	return true;
 }
 
-static int rb_meta_subbuf_idx(struct ring_buffer_meta *meta, void *subbuf);
+static int rb_meta_subbuf_idx(struct ring_buffer_cpu_meta *meta, void *subbuf);
 
 static int rb_read_data_buffer(struct buffer_data_page *dpage, int tail, int cpu,
 			       unsigned long long *timestamp, u64 *delta_ptr)
@@ -1721,6 +1833,7 @@ static int rb_read_data_buffer(struct buffer_data_page *dpage, int tail, int cpu
 	struct ring_buffer_event *event;
 	u64 ts, delta;
 	int events = 0;
+	int len;
 	int e;
 
 	*delta_ptr = 0;
@@ -1728,9 +1841,12 @@ static int rb_read_data_buffer(struct buffer_data_page *dpage, int tail, int cpu
 
 	ts = dpage->time_stamp;
 
-	for (e = 0; e < tail; e += rb_event_length(event)) {
+	for (e = 0; e < tail; e += len) {
 
 		event = (struct ring_buffer_event *)(dpage->data + e);
+		len = rb_event_length(event);
+		if (len <= 0 || len > tail - e)
+			return -1;
 
 		switch (event->type_len) {
 
@@ -1767,41 +1883,147 @@ static int rb_read_data_buffer(struct buffer_data_page *dpage, int tail, int cpu
 	return events;
 }
 
-static int rb_validate_buffer(struct buffer_data_page *dpage, int cpu)
+static int rb_validate_buffer(struct buffer_data_page *dpage, int cpu,
+			      struct ring_buffer_cpu_meta *meta)
 {
 	unsigned long long ts;
+	unsigned long tail;
 	u64 delta;
-	int tail;
 
-	tail = local_read(&dpage->commit);
+	/*
+	 * When a sub-buffer is recovered from a read, the commit value may
+	 * have RB_MISSED_* bits set, as these bits are reset on reuse.
+	 * Even after clearing these bits, a commit value greater than the
+	 * subbuf_size is considered invalid.
+	 */
+	tail = local_read(&dpage->commit) & ~RB_MISSED_MASK;
+	if (tail > meta->subbuf_size)
+		return -1;
 	return rb_read_data_buffer(dpage, tail, cpu, &ts, &delta);
 }
 
 /* If the meta data has been validated, now validate the events */
 static void rb_meta_validate_events(struct ring_buffer_per_cpu *cpu_buffer)
 {
-	struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
-	struct buffer_page *head_page;
+	struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
+	struct buffer_page *head_page, *orig_head;
 	unsigned long entry_bytes = 0;
 	unsigned long entries = 0;
+	int discarded = 0;
 	int ret;
+	u64 ts;
 	int i;
 
 	if (!meta || !meta->head_buffer)
 		return;
 
 	/* Do the reader page first */
-	ret = rb_validate_buffer(cpu_buffer->reader_page->page, cpu_buffer->cpu);
+	ret = rb_validate_buffer(cpu_buffer->reader_page->page, cpu_buffer->cpu, meta);
 	if (ret < 0) {
-		pr_info("Ring buffer reader page is invalid\n");
-		goto invalid;
+		pr_info("Ring buffer meta [%d] invalid reader page detected\n",
+			cpu_buffer->cpu);
+		discarded++;
+		/* Instead of discard whole ring buffer, discard only this sub-buffer. */
+		local_set(&cpu_buffer->reader_page->entries, 0);
+		local_set(&cpu_buffer->reader_page->page->commit, 0);
+	} else {
+		entries += ret;
+		entry_bytes += rb_page_size(cpu_buffer->reader_page);
+		local_set(&cpu_buffer->reader_page->entries, ret);
 	}
-	entries += ret;
-	entry_bytes += local_read(&cpu_buffer->reader_page->page->commit);
-	local_set(&cpu_buffer->reader_page->entries, ret);
 
-	head_page = cpu_buffer->head_page;
+	orig_head = head_page = cpu_buffer->head_page;
+	ts = head_page->page->time_stamp;
 
+	/*
+	 * Try to rewind the head so that we can read the pages which already
+	 * read in the previous boot.
+	 */
+	if (head_page == cpu_buffer->tail_page)
+		goto skip_rewind;
+
+	rb_dec_page(&head_page);
+	for (i = 0; i < meta->nr_subbufs + 1; i++, rb_dec_page(&head_page)) {
+
+		/* Rewind until tail (writer) page. */
+		if (head_page == cpu_buffer->tail_page)
+			break;
+
+		/* Ensure the page has older data than head. */
+		if (ts < head_page->page->time_stamp)
+			break;
+
+		ts = head_page->page->time_stamp;
+		/* Ensure the page has correct timestamp and some data. */
+		if (!ts || rb_page_commit(head_page) == 0)
+			break;
+
+		/* Stop rewind if the page is invalid. */
+		ret = rb_validate_buffer(head_page->page, cpu_buffer->cpu, meta);
+		if (ret < 0)
+			break;
+
+		/* Recover the number of entries and update stats. */
+		local_set(&head_page->entries, ret);
+		if (ret)
+			local_inc(&cpu_buffer->pages_touched);
+		entries += ret;
+		entry_bytes += rb_page_commit(head_page);
+	}
+	if (i)
+		pr_info("Ring buffer [%d] rewound %d pages\n", cpu_buffer->cpu, i);
+
+	/* The last rewound page must be skipped. */
+	if (head_page != orig_head)
+		rb_inc_page(&head_page);
+
+	/*
+	 * If the ring buffer was rewound, then inject the reader page
+	 * into the location just before the original head page.
+	 */
+	if (head_page != orig_head) {
+		struct buffer_page *bpage = orig_head;
+
+		rb_dec_page(&bpage);
+		/*
+		 * Insert the reader_page before the original head page.
+		 * Since the list encode RB_PAGE flags, general list
+		 * operations should be avoided.
+		 */
+		cpu_buffer->reader_page->list.next = &orig_head->list;
+		cpu_buffer->reader_page->list.prev = orig_head->list.prev;
+		orig_head->list.prev = &cpu_buffer->reader_page->list;
+		bpage->list.next = &cpu_buffer->reader_page->list;
+
+		/* Make the head_page the reader page */
+		cpu_buffer->reader_page = head_page;
+		bpage = head_page;
+		rb_inc_page(&head_page);
+		head_page->list.prev = bpage->list.prev;
+		rb_dec_page(&bpage);
+		bpage->list.next = &head_page->list;
+		rb_set_list_to_head(&bpage->list);
+		cpu_buffer->pages = &head_page->list;
+
+		cpu_buffer->head_page = head_page;
+		meta->head_buffer = (unsigned long)head_page->page;
+
+		/* Reset all the indexes */
+		bpage = cpu_buffer->reader_page;
+		meta->buffers[0] = rb_meta_subbuf_idx(meta, bpage->page);
+		bpage->id = 0;
+
+		for (i = 1, bpage = head_page; i < meta->nr_subbufs;
+		     i++, rb_inc_page(&bpage)) {
+			meta->buffers[i] = rb_meta_subbuf_idx(meta, bpage->page);
+			bpage->id = i;
+		}
+
+		/* We'll restart verifying from orig_head */
+		head_page = orig_head;
+	}
+
+ skip_rewind:
 	/* If the commit_buffer is the reader page, update the commit page */
 	if (meta->commit_buffer == (unsigned long)cpu_buffer->reader_page->page) {
 		cpu_buffer->commit_page = cpu_buffer->reader_page;
@@ -1816,21 +2038,24 @@ static void rb_meta_validate_events(struct ring_buffer_per_cpu *cpu_buffer)
 		if (head_page == cpu_buffer->reader_page)
 			continue;
 
-		ret = rb_validate_buffer(head_page->page, cpu_buffer->cpu);
+		ret = rb_validate_buffer(head_page->page, cpu_buffer->cpu, meta);
 		if (ret < 0) {
-			pr_info("Ring buffer meta [%d] invalid buffer page\n",
-				cpu_buffer->cpu);
-			goto invalid;
+			if (!discarded)
+				pr_info("Ring buffer meta [%d] invalid buffer page detected\n",
+					cpu_buffer->cpu);
+			discarded++;
+			/* Instead of discard whole ring buffer, discard only this sub-buffer. */
+			local_set(&head_page->entries, 0);
+			local_set(&head_page->page->commit, 0);
+		} else {
+			/* If the buffer has content, update pages_touched */
+			if (ret)
+				local_inc(&cpu_buffer->pages_touched);
+
+			entries += ret;
+			entry_bytes += rb_page_size(head_page);
+			local_set(&head_page->entries, ret);
 		}
-
-		/* If the buffer has content, update pages_touched */
-		if (ret)
-			local_inc(&cpu_buffer->pages_touched);
-
-		entries += ret;
-		entry_bytes += local_read(&head_page->page->commit);
-		local_set(&cpu_buffer->head_page->entries, ret);
-
 		if (head_page == cpu_buffer->commit_page)
 			break;
 	}
@@ -1844,7 +2069,8 @@ static void rb_meta_validate_events(struct ring_buffer_per_cpu *cpu_buffer)
 	local_set(&cpu_buffer->entries, entries);
 	local_set(&cpu_buffer->entries_bytes, entry_bytes);
 
-	pr_info("Ring buffer meta [%d] is from previous boot!\n", cpu_buffer->cpu);
+	pr_info("Ring buffer meta [%d] is from previous boot! (%d pages discarded)\n",
+		cpu_buffer->cpu, discarded);
 	return;
 
  invalid:
@@ -1863,24 +2089,13 @@ static void rb_meta_validate_events(struct ring_buffer_per_cpu *cpu_buffer)
 	}
 }
 
-/* Used to calculate data delta */
-static char rb_data_ptr[] = "";
-
-#define THIS_TEXT_PTR		((unsigned long)rb_meta_init_text_addr)
-#define THIS_DATA_PTR		((unsigned long)rb_data_ptr)
-
-static void rb_meta_init_text_addr(struct ring_buffer_meta *meta)
+static void rb_range_meta_init(struct trace_buffer *buffer, int nr_pages, int scratch_size)
 {
-	meta->text_addr = THIS_TEXT_PTR;
-	meta->data_addr = THIS_DATA_PTR;
-}
-
-static void rb_range_meta_init(struct trace_buffer *buffer, int nr_pages)
-{
-	struct ring_buffer_meta *meta;
+	struct ring_buffer_cpu_meta *meta;
 	unsigned long *subbuf_mask;
 	unsigned long delta;
 	void *subbuf;
+	bool valid = false;
 	int cpu;
 	int i;
 
@@ -1888,20 +2103,21 @@ static void rb_range_meta_init(struct trace_buffer *buffer, int nr_pages)
 	subbuf_mask = bitmap_alloc(nr_pages + 1, GFP_KERNEL);
 	/* If subbuf_mask fails to allocate, then rb_meta_valid() will return false */
 
+	if (rb_meta_init(buffer, scratch_size))
+		valid = true;
+
 	for (cpu = 0; cpu < nr_cpu_ids; cpu++) {
 		void *next_meta;
 
 		meta = rb_range_meta(buffer, nr_pages, cpu);
 
-		if (rb_meta_valid(meta, cpu, buffer, nr_pages, subbuf_mask)) {
+		if (valid && rb_cpu_meta_valid(meta, cpu, buffer, nr_pages, subbuf_mask)) {
 			/* Make the mappings match the current address */
 			subbuf = rb_subbufs_from_meta(meta);
 			delta = (unsigned long)subbuf - meta->first_buffer;
 			meta->first_buffer += delta;
 			meta->head_buffer += delta;
 			meta->commit_buffer += delta;
-			buffer->last_text_delta = THIS_TEXT_PTR - meta->text_addr;
-			buffer->last_data_delta = THIS_DATA_PTR - meta->data_addr;
 			continue;
 		}
 
@@ -1912,16 +2128,12 @@ static void rb_range_meta_init(struct trace_buffer *buffer, int nr_pages)
 
 		memset(meta, 0, next_meta - (void *)meta);
 
-		meta->magic = RING_BUFFER_META_MAGIC;
-		meta->struct_size = sizeof(*meta);
-
 		meta->nr_subbufs = nr_pages + 1;
 		meta->subbuf_size = PAGE_SIZE;
 
 		subbuf = rb_subbufs_from_meta(meta);
 
 		meta->first_buffer = (unsigned long)subbuf;
-		rb_meta_init_text_addr(meta);
 
 		/*
 		 * The buffers[] array holds the order of the sub-buffers
@@ -1943,7 +2155,7 @@ static void rb_range_meta_init(struct trace_buffer *buffer, int nr_pages)
 static void *rbm_start(struct seq_file *m, loff_t *pos)
 {
 	struct ring_buffer_per_cpu *cpu_buffer = m->private;
-	struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+	struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 	unsigned long val;
 
 	if (!meta)
@@ -1968,7 +2180,7 @@ static void *rbm_next(struct seq_file *m, void *v, loff_t *pos)
 static int rbm_show(struct seq_file *m, void *v)
 {
 	struct ring_buffer_per_cpu *cpu_buffer = m->private;
-	struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+	struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 	unsigned long val = (unsigned long)v;
 
 	if (val == 1) {
@@ -2017,7 +2229,7 @@ int ring_buffer_meta_seq_init(struct file *file, struct trace_buffer *buffer, in
 static void rb_meta_buffer_update(struct ring_buffer_per_cpu *cpu_buffer,
 				  struct buffer_page *bpage)
 {
-	struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+	struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 
 	if (meta->head_buffer == (unsigned long)bpage->page)
 		cpu_buffer->head_page = bpage;
@@ -2032,7 +2244,7 @@ static int __rb_allocate_pages(struct ring_buffer_per_cpu *cpu_buffer,
 		long nr_pages, struct list_head *pages)
 {
 	struct trace_buffer *buffer = cpu_buffer->buffer;
-	struct ring_buffer_meta *meta = NULL;
+	struct ring_buffer_cpu_meta *meta = NULL;
 	struct buffer_page *bpage, *tmp;
 	bool user_thread = current->mm != NULL;
 	gfp_t mflags;
@@ -2182,7 +2394,7 @@ static struct ring_buffer_per_cpu *
 rb_allocate_cpu_buffer(struct trace_buffer *buffer, long nr_pages, int cpu)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
-	struct ring_buffer_meta *meta;
+	struct ring_buffer_cpu_meta *meta;
 	struct buffer_page *bpage;
 	struct page *page;
 	int ret;
@@ -2254,7 +2466,7 @@ rb_allocate_cpu_buffer(struct trace_buffer *buffer, long nr_pages, int cpu)
 	} else {
 		page = alloc_pages_node(cpu_to_node(cpu),
 					GFP_KERNEL | __GFP_COMP | __GFP_ZERO,
-					cpu_buffer->buffer->subbuf_order);
+					bpage->order);
 		if (!page)
 			goto fail_free_reader;
 		bpage->page = page_address(page);
@@ -2337,9 +2549,20 @@ static void rb_free_cpu_buffer(struct ring_buffer_per_cpu *cpu_buffer)
 	kfree(cpu_buffer);
 }
 
+/* Stop recording on a persistent buffer and flush cache if needed. */
+static int rb_flush_buffer_cb(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct trace_buffer *buffer = container_of(nb, struct trace_buffer, flush_nb);
+
+	ring_buffer_record_off(buffer);
+	arch_ring_buffer_flush_range(buffer->range_addr_start, buffer->range_addr_end);
+	return NOTIFY_DONE;
+}
+
 static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 					 int order, unsigned long start,
 					 unsigned long end,
+					 unsigned long scratch_size,
 					 struct lock_class_key *key,
 					 struct ring_buffer_writer *writer)
 {
@@ -2361,10 +2584,9 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 
 	buffer->subbuf_order = order;
 	subbuf_size = (PAGE_SIZE << order);
-	buffer->subbuf_size = subbuf_size - BUF_PAGE_HDR_SIZE;
 
 	/* Max payload is buffer page size - header (8bytes) */
-	buffer->max_data_size = buffer->subbuf_size - (sizeof(u32) * 2);
+	buffer->max_data_size = rb_subbuf_capacity(buffer) - (sizeof(u32) * 2);
 
 	buffer->flags = flags;
 	buffer->clock = trace_clock_local;
@@ -2388,10 +2610,23 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 
 	/* If start/end are specified, then that overrides size */
 	if (start && end) {
+		unsigned long buffers_start;
 		unsigned long ptr;
 		int n;
 
-		size = end - start;
+		/* Make sure that start is word aligned */
+		start = ALIGN(start, sizeof(long));
+
+		/* scratch_size needs to be aligned too */
+		scratch_size = ALIGN(scratch_size, sizeof(long));
+
+		/* Subtract the buffer meta data and word aligned */
+		buffers_start = start + sizeof(struct ring_buffer_cpu_meta);
+		buffers_start = ALIGN(buffers_start, sizeof(long));
+		buffers_start += scratch_size;
+
+		/* Calculate the size for the per CPU data */
+		size = end - buffers_start;
 		size = size / nr_cpu_ids;
 
 		/*
@@ -2401,7 +2636,7 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 		 * needed, plus account for the integer array index that
 		 * will be appended to the meta data.
 		 */
-		nr_pages = (size - sizeof(struct ring_buffer_meta)) /
+		nr_pages = (size - sizeof(struct ring_buffer_cpu_meta)) /
 			(subbuf_size + sizeof(int));
 		/* Need at least two pages plus the reader page */
 		if (nr_pages < 3)
@@ -2409,8 +2644,8 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 
  again:
 		/* Make sure that the size fits aligned */
-		for (n = 0, ptr = start; n < nr_cpu_ids; n++) {
-			ptr += sizeof(struct ring_buffer_meta) +
+		for (n = 0, ptr = buffers_start; n < nr_cpu_ids; n++) {
+			ptr += sizeof(struct ring_buffer_cpu_meta) +
 				sizeof(int) * nr_pages;
 			ptr = ALIGN(ptr, subbuf_size);
 			ptr += subbuf_size * nr_pages;
@@ -2427,11 +2662,10 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 		buffer->range_addr_start = start;
 		buffer->range_addr_end = end;
 
-		rb_range_meta_init(buffer, nr_pages);
+		rb_range_meta_init(buffer, nr_pages, scratch_size);
 	} else {
-
 		/* need at least two pages */
-		nr_pages = DIV_ROUND_UP(size, buffer->subbuf_size);
+		nr_pages = DIV_ROUND_UP(size, rb_subbuf_capacity(buffer));
 		if (nr_pages < 2)
 			nr_pages = 2;
 	}
@@ -2447,6 +2681,12 @@ static struct trace_buffer *alloc_buffer(unsigned long size, unsigned flags,
 		goto fail_free_buffers;
 
 	mutex_init(&buffer->mutex);
+
+	/* Persistent ring buffer needs to flush cache before reboot. */
+	if (start && end) {
+		buffer->flush_nb.notifier_call = rb_flush_buffer_cb;
+		atomic_notifier_chain_register(&panic_notifier_list, &buffer->flush_nb);
+	}
 
 	return buffer;
 
@@ -2481,7 +2721,7 @@ struct trace_buffer *__ring_buffer_alloc(unsigned long size, unsigned flags,
 					 struct ring_buffer_writer *writer)
 {
 	/* Default buffer page size - one system page */
-	return alloc_buffer(size, flags, get_order(__PAGE_SIZE), 0, 0, key, writer);
+	return alloc_buffer(size, flags, get_order(__PAGE_SIZE), 0, 0, 0, key, writer);
 
 }
 EXPORT_SYMBOL_GPL(__ring_buffer_alloc);
@@ -2493,6 +2733,7 @@ EXPORT_SYMBOL_GPL(__ring_buffer_alloc);
  * @start: start of allocated range
  * @range_size: size of allocated range
  * @order: sub-buffer order
+ * @scratch_size: size of scratch area (for preallocated memory buffers)
  * @key: ring buffer reader_lock_key.
  *
  * Currently the only flag that is available is the RB_FL_OVERWRITE
@@ -2503,32 +2744,29 @@ EXPORT_SYMBOL_GPL(__ring_buffer_alloc);
 struct trace_buffer *__ring_buffer_alloc_range(unsigned long size, unsigned flags,
 					       int order, unsigned long start,
 					       unsigned long range_size,
+					       unsigned long scratch_size,
 					       struct lock_class_key *key)
 {
-	return alloc_buffer(size, flags, order, start, start + range_size, key, NULL);
+	return alloc_buffer(size, flags, order, start, start + range_size,
+			    scratch_size, key, NULL);
 }
 
-/**
- * ring_buffer_last_boot_delta - return the delta offset from last boot
- * @buffer: The buffer to return the delta from
- * @text: Return text delta
- * @data: Return data delta
- *
- * Returns: The true if the delta is non zero
- */
-bool ring_buffer_last_boot_delta(struct trace_buffer *buffer, long *text,
-				 long *data)
+void *ring_buffer_meta_scratch(struct trace_buffer *buffer, unsigned int *size)
 {
-	if (!buffer)
-		return false;
+	struct ring_buffer_meta *meta;
+	void *ptr;
 
-	if (!buffer->last_text_delta)
-		return false;
+	if (!buffer || !buffer->meta)
+		return NULL;
 
-	*text = buffer->last_text_delta;
-	*data = buffer->last_data_delta;
+	meta = buffer->meta;
 
-	return true;
+	ptr = (void *)ALIGN((unsigned long)meta + sizeof(*meta), sizeof(long));
+
+	if (size)
+		*size = (void *)meta + meta->buffers_offset - ptr;
+
+	return ptr;
 }
 
 /**
@@ -2539,6 +2777,9 @@ void
 ring_buffer_free(struct trace_buffer *buffer)
 {
 	int cpu;
+
+	if (buffer->range_addr_start && buffer->range_addr_end)
+		atomic_notifier_chain_unregister(&panic_notifier_list, &buffer->flush_nb);
 
 	cpuhp_state_remove_instance(CPUHP_TRACE_RB_PREPARE, &buffer->node);
 
@@ -2800,7 +3041,7 @@ static void update_pages_handler(struct work_struct *work)
  * @size: the new size.
  * @cpu_id: the cpu buffer to resize
  *
- * Minimum size is 2 * buffer->subbuf_size.
+ * Minimum size is 2 * rb_subbuf_capacity(buffer).
  *
  * Returns 0 on success and < 0 on failure.
  */
@@ -2822,12 +3063,6 @@ int ring_buffer_resize(struct trace_buffer *buffer, unsigned long size,
 	    !cpumask_test_cpu(cpu_id, buffer->cpumask))
 		return 0;
 
-	nr_pages = DIV_ROUND_UP(size, buffer->subbuf_size);
-
-	/* we need a minimum of two pages */
-	if (nr_pages < 2)
-		nr_pages = 2;
-
 	/*
 	 * Keep CPUs from coming online while resizing to synchronize
 	 * with new per CPU buffers being created.
@@ -2837,6 +3072,12 @@ int ring_buffer_resize(struct trace_buffer *buffer, unsigned long size,
 	/* prevent another thread from changing buffer sizes */
 	mutex_lock(&buffer->mutex);
 	atomic_inc(&buffer->resizing);
+
+	nr_pages = DIV_ROUND_UP(size, rb_subbuf_capacity(buffer));
+
+	/* we need a minimum of two pages */
+	if (nr_pages < 2)
+		nr_pages = 2;
 
 	if (cpu_id == RING_BUFFER_ALL_CPUS) {
 		/*
@@ -3006,6 +3247,8 @@ int ring_buffer_resize(struct trace_buffer *buffer, unsigned long size,
 					list) {
 			list_del_init(&bpage->list);
 			free_buffer_page(bpage);
+
+			cond_resched();
 		}
 	}
  out_err_unlock:
@@ -3097,12 +3340,6 @@ rb_iter_head_event(struct ring_buffer_iter *iter)
 	return NULL;
 }
 
-/* Size is determined by what has been committed */
-static __always_inline unsigned rb_page_size(struct buffer_page *bpage)
-{
-	return rb_page_commit(bpage) & ~RB_MISSED_MASK;
-}
-
 static __always_inline unsigned
 rb_commit_index(struct ring_buffer_per_cpu *cpu_buffer)
 {
@@ -3114,7 +3351,7 @@ rb_event_index(struct ring_buffer_per_cpu *cpu_buffer, struct ring_buffer_event 
 {
 	unsigned long addr = (unsigned long)event;
 
-	addr &= (PAGE_SIZE << cpu_buffer->buffer->subbuf_order) - 1;
+	addr &= (unsigned long)rb_subbuf_size(cpu_buffer->buffer) - 1;
 
 	return addr - BUF_PAGE_HDR_SIZE;
 }
@@ -3140,7 +3377,7 @@ static void rb_inc_iter(struct ring_buffer_iter *iter)
 }
 
 /* Return the index into the sub-buffers for a given sub-buffer */
-static int rb_meta_subbuf_idx(struct ring_buffer_meta *meta, void *subbuf)
+static int rb_meta_subbuf_idx(struct ring_buffer_cpu_meta *meta, void *subbuf)
 {
 	void *subbuf_array;
 
@@ -3152,7 +3389,7 @@ static int rb_meta_subbuf_idx(struct ring_buffer_meta *meta, void *subbuf)
 static void rb_update_meta_head(struct ring_buffer_per_cpu *cpu_buffer,
 				struct buffer_page *next_page)
 {
-	struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+	struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 	unsigned long old_head = (unsigned long)next_page->page;
 	unsigned long new_head;
 
@@ -3169,7 +3406,7 @@ static void rb_update_meta_head(struct ring_buffer_per_cpu *cpu_buffer,
 static void rb_update_meta_reader(struct ring_buffer_per_cpu *cpu_buffer,
 				  struct buffer_page *reader)
 {
-	struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+	struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 	void *old_reader = cpu_buffer->reader_page->page;
 	void *new_reader = reader->page;
 	int id;
@@ -3353,8 +3590,8 @@ static inline void
 rb_reset_tail(struct ring_buffer_per_cpu *cpu_buffer,
 	      unsigned long tail, struct rb_event_info *info)
 {
-	unsigned long bsize = READ_ONCE(cpu_buffer->buffer->subbuf_size);
 	struct buffer_page *tail_page = info->tail_page;
+	unsigned long bsize = rb_page_capacity(tail_page);
 	struct ring_buffer_event *event;
 	unsigned long length = info->length;
 
@@ -3706,8 +3943,7 @@ rb_try_to_discard(struct ring_buffer_per_cpu *cpu_buffer,
 
 	new_index = rb_event_index(cpu_buffer, event);
 	old_index = new_index + rb_event_ts_length(event);
-	addr = (unsigned long)event;
-	addr &= ~((PAGE_SIZE << cpu_buffer->buffer->subbuf_order) - 1);
+	addr = rb_subbuf_start(cpu_buffer->buffer, (unsigned long)event);
 
 	bpage = READ_ONCE(cpu_buffer->tail_page);
 
@@ -3798,7 +4034,7 @@ rb_set_commit_to_write(struct ring_buffer_per_cpu *cpu_buffer)
 			  rb_page_write(cpu_buffer->commit_page));
 		rb_inc_page(&cpu_buffer->commit_page);
 		if (cpu_buffer->ring_meta) {
-			struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+			struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 			meta->commit_buffer = (unsigned long)cpu_buffer->commit_page->page;
 		}
 		/* add barrier to keep gcc from optimizing too much */
@@ -4354,7 +4590,7 @@ __rb_reserve_next(struct ring_buffer_per_cpu *cpu_buffer,
 	tail = write - info->length;
 
 	/* See if we shot pass the end of this buffer page */
-	if (unlikely(write > cpu_buffer->buffer->subbuf_size)) {
+	if (unlikely(write > rb_page_capacity(tail_page))) {
 		check_buffer(cpu_buffer, info, CHECK_FULL_PAGE);
 		return rb_move_tail(cpu_buffer, tail, info);
 	}
@@ -4599,7 +4835,7 @@ rb_decrement_entry(struct ring_buffer_per_cpu *cpu_buffer,
 	struct buffer_page *bpage = cpu_buffer->commit_page;
 	struct buffer_page *start;
 
-	addr &= ~((PAGE_SIZE << cpu_buffer->buffer->subbuf_order) - 1);
+	addr = rb_subbuf_start(cpu_buffer->buffer, addr);
 
 	/* Do the likely case first */
 	if (likely(bpage->page == (void *)addr)) {
@@ -5115,6 +5351,7 @@ static void rb_iter_reset(struct ring_buffer_iter *iter)
 	iter->head_page = cpu_buffer->reader_page;
 	iter->head = cpu_buffer->reader_page->read;
 	iter->next_event = iter->head;
+	iter->missed_events = 0;
 
 	iter->cache_reader_page = iter->head_page;
 	iter->cache_read = cpu_buffer->read;
@@ -5319,7 +5556,6 @@ static struct buffer_page *
 __rb_get_reader_page(struct ring_buffer_per_cpu *cpu_buffer)
 {
 	struct buffer_page *reader = NULL;
-	unsigned long bsize = READ_ONCE(cpu_buffer->buffer->subbuf_size);
 	unsigned long overwrite;
 	unsigned long flags;
 	int nr_loops = 0;
@@ -5365,7 +5601,6 @@ __rb_get_reader_page(struct ring_buffer_per_cpu *cpu_buffer)
 	 */
 	local_set(&cpu_buffer->reader_page->write, 0);
 	local_set(&cpu_buffer->reader_page->entries, 0);
-	local_set(&cpu_buffer->reader_page->page->commit, 0);
 	cpu_buffer->reader_page->real_end = 0;
 
  spin:
@@ -5459,7 +5694,7 @@ __rb_get_reader_page(struct ring_buffer_per_cpu *cpu_buffer)
 #define USECS_WAIT	1000000
         for (nr_loops = 0; nr_loops < USECS_WAIT; nr_loops++) {
 		/* If the write is past the end of page, a writer is still updating it */
-		if (likely(!reader || rb_page_write(reader) <= bsize))
+		if (likely(!reader || rb_page_write(reader) <= rb_page_capacity(reader)))
 			break;
 
 		udelay(1);
@@ -5792,10 +6027,7 @@ ring_buffer_peek(struct trace_buffer *buffer, int cpu, u64 *ts,
  */
 bool ring_buffer_iter_dropped(struct ring_buffer_iter *iter)
 {
-	bool ret = iter->missed_events != 0;
-
-	iter->missed_events = 0;
-	return ret;
+	return iter->missed_events != 0;
 }
 EXPORT_SYMBOL_GPL(ring_buffer_iter_dropped);
 
@@ -5891,36 +6123,44 @@ EXPORT_SYMBOL_GPL(ring_buffer_consume);
 struct ring_buffer_iter *
 ring_buffer_read_start(struct trace_buffer *buffer, int cpu, gfp_t flags)
 {
+	struct ring_buffer_iter *iter __free(kfree) = kzalloc_obj(*iter, flags);
 	struct ring_buffer_per_cpu *cpu_buffer;
-	struct ring_buffer_iter *iter;
+
+	if (!iter)
+		return NULL;
 
 	if (!cpumask_test_cpu(cpu, buffer->cpumask) || buffer->writer)
 		return NULL;
 
-	iter = kzalloc(sizeof(*iter), flags);
-	if (!iter)
-		return NULL;
-
-	/* Holds the entire event: data and meta data */
-	iter->event_size = buffer->subbuf_size;
-	iter->event = kmalloc(iter->event_size, flags);
-	if (!iter->event) {
-		kfree(iter);
-		return NULL;
-	}
-
 	cpu_buffer = buffer->buffers[cpu];
 
-	iter->cpu_buffer = cpu_buffer;
+	/*
+	 * Only KDB is using GFP_ATOMIC, for the others, lock the buffer to
+	 * prevent concurrent resizing.
+	 */
+	if (gfpflags_allow_blocking(flags))
+		mutex_lock(&buffer->mutex);
 
 	atomic_inc(&cpu_buffer->resize_disabled);
+
+	if (gfpflags_allow_blocking(flags))
+		mutex_unlock(&buffer->mutex);
+
+	/* Holds the entire event: data and meta data. */
+	iter->event_size = rb_page_capacity(READ_ONCE(cpu_buffer->reader_page));
+	iter->event = kmalloc(iter->event_size, flags);
+	if (!iter->event) {
+		atomic_dec(&cpu_buffer->resize_disabled);
+		return NULL;
+	}
+	iter->cpu_buffer = cpu_buffer;
 
 	guard(raw_spinlock_irqsave)(&cpu_buffer->reader_lock);
 	arch_spin_lock(&cpu_buffer->lock);
 	rb_iter_reset(iter);
 	arch_spin_unlock(&cpu_buffer->lock);
 
-	return iter;
+	return_ptr(iter);
 }
 EXPORT_SYMBOL_GPL(ring_buffer_read_start);
 
@@ -5957,7 +6197,7 @@ void ring_buffer_iter_advance(struct ring_buffer_iter *iter)
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
-
+	iter->missed_events = 0;
 	rb_advance_iter(iter);
 
 	raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
@@ -5974,7 +6214,7 @@ unsigned long ring_buffer_size(struct trace_buffer *buffer, int cpu)
 	if (!cpumask_test_cpu(cpu, buffer->cpumask))
 		return 0;
 
-	return buffer->subbuf_size * buffer->buffers[cpu]->nr_pages;
+	return rb_subbuf_capacity(buffer) * buffer->buffers[cpu]->nr_pages;
 }
 EXPORT_SYMBOL_GPL(ring_buffer_size);
 
@@ -6001,6 +6241,39 @@ static void rb_clear_buffer_page(struct buffer_page *page)
 	page->read = 0;
 }
 
+/*
+ * When the buffer is memory mapped to user space, each sub buffer
+ * has a unique id that is used by the meta data to tell the user
+ * where the current reader page is.
+ *
+ * For a normal allocated ring buffer, the id is saved in the buffer page
+ * id field, and updated via this function.
+ *
+ * But for a fixed memory mapped buffer, the id is already assigned for
+ * fixed memory ording in the memory layout and can not be used. Instead
+ * the index of where the page lies in the memory layout is used.
+ *
+ * For the normal pages, set the buffer page id with the passed in @id
+ * value and return that.
+ *
+ * For fixed memory mapped pages, get the page index in the memory layout
+ * and return that as the id.
+ */
+static int rb_page_id(struct ring_buffer_per_cpu *cpu_buffer,
+		      struct buffer_page *bpage, int id)
+{
+	/*
+	 * For boot buffers, the id is the index,
+	 * otherwise, set the buffer page with this id
+	 */
+	if (cpu_buffer->ring_meta)
+		id = rb_meta_subbuf_idx(cpu_buffer->ring_meta, bpage->page);
+	else
+		bpage->id = id;
+
+	return id;
+}
+
 static void rb_update_meta_page(struct ring_buffer_per_cpu *cpu_buffer)
 {
 	struct trace_buffer_meta *meta = cpu_buffer->meta_page;
@@ -6009,7 +6282,9 @@ static void rb_update_meta_page(struct ring_buffer_per_cpu *cpu_buffer)
 		return;
 
 	meta->reader.read = cpu_buffer->reader_page->read;
-	meta->reader.id = cpu_buffer->reader_page->id;
+	meta->reader.id = rb_page_id(cpu_buffer, cpu_buffer->reader_page,
+				     cpu_buffer->reader_page->id);
+
 	meta->reader.lost_events = cpu_buffer->lost_events;
 
 	meta->entries = local_read(&cpu_buffer->entries);
@@ -6087,7 +6362,7 @@ rb_reset_cpu(struct ring_buffer_per_cpu *cpu_buffer)
 	if (cpu_buffer->mapped) {
 		rb_update_meta_page(cpu_buffer);
 		if (cpu_buffer->ring_meta) {
-			struct ring_buffer_meta *meta = cpu_buffer->ring_meta;
+			struct ring_buffer_cpu_meta *meta = cpu_buffer->ring_meta;
 			meta->commit_buffer = meta->head_buffer;
 		}
 	}
@@ -6121,7 +6396,6 @@ static void reset_disabled_cpu_buffer(struct ring_buffer_per_cpu *cpu_buffer)
 void ring_buffer_reset_cpu(struct trace_buffer *buffer, int cpu)
 {
 	struct ring_buffer_per_cpu *cpu_buffer = buffer->buffers[cpu];
-	struct ring_buffer_meta *meta;
 
 	if (!cpumask_test_cpu(cpu, buffer->cpumask))
 		return;
@@ -6140,11 +6414,6 @@ void ring_buffer_reset_cpu(struct trace_buffer *buffer, int cpu)
 	atomic_dec(&cpu_buffer->record_disabled);
 	atomic_dec(&cpu_buffer->resize_disabled);
 
-	/* Make sure persistent meta now uses this buffer's addresses */
-	meta = rb_range_meta(buffer, 0, cpu_buffer->cpu);
-	if (meta)
-		rb_meta_init_text_addr(meta);
-
 	mutex_unlock(&buffer->mutex);
 }
 EXPORT_SYMBOL_GPL(ring_buffer_reset_cpu);
@@ -6159,7 +6428,6 @@ EXPORT_SYMBOL_GPL(ring_buffer_reset_cpu);
 void ring_buffer_reset_online_cpus(struct trace_buffer *buffer)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
-	struct ring_buffer_meta *meta;
 	int cpu;
 
 	/* prevent another thread from changing buffer sizes */
@@ -6186,11 +6454,6 @@ void ring_buffer_reset_online_cpus(struct trace_buffer *buffer)
 			continue;
 
 		reset_disabled_cpu_buffer(cpu_buffer);
-
-		/* Make sure persistent meta now uses this buffer's addresses */
-		meta = rb_range_meta(buffer, 0, cpu_buffer->cpu);
-		if (meta)
-			rb_meta_init_text_addr(meta);
 
 		atomic_dec(&cpu_buffer->record_disabled);
 		atomic_sub(RESET_BIT, &cpu_buffer->resize_disabled);
@@ -6600,14 +6863,15 @@ int ring_buffer_read_page(struct trace_buffer *buffer,
 
 	if (!data_page || !data_page->data)
 		goto out;
-	if (data_page->order != buffer->subbuf_order)
-		goto out;
 
 	bpage = data_page->data;
 	if (!bpage)
 		goto out;
 
 	raw_spin_lock_irqsave(&cpu_buffer->reader_lock, flags);
+
+	if (data_page->order != cpu_buffer->reader_page->order)
+		goto out_unlock;
 
 	reader = rb_get_reader_page(cpu_buffer);
 	if (!reader)
@@ -6726,7 +6990,7 @@ int ring_buffer_read_page(struct trace_buffer *buffer,
 		/* If there is room at the end of the page to save the
 		 * missed events, then record it there.
 		 */
-		if (buffer->subbuf_size - commit >= sizeof(missed_events)) {
+		if (rb_page_capacity(reader) - commit >= sizeof(missed_events)) {
 			memcpy(&bpage->data[commit], &missed_events,
 			       sizeof(missed_events));
 			local_add(RB_MISSED_STORED, &bpage->commit);
@@ -6738,8 +7002,8 @@ int ring_buffer_read_page(struct trace_buffer *buffer,
 	/*
 	 * This page may be off to user land. Zero it out here.
 	 */
-	if (commit < buffer->subbuf_size)
-		memset(&bpage->data[commit], 0, buffer->subbuf_size - commit);
+	if (commit < rb_page_capacity(reader))
+		memset(&bpage->data[commit], 0, rb_page_capacity(reader) - commit);
 
  out_unlock:
 	raw_spin_unlock_irqrestore(&cpu_buffer->reader_lock, flags);
@@ -6769,7 +7033,7 @@ EXPORT_SYMBOL_GPL(ring_buffer_read_page_data);
  */
 int ring_buffer_subbuf_size_get(struct trace_buffer *buffer)
 {
-	return buffer->subbuf_size + BUF_PAGE_HDR_SIZE;
+	return rb_subbuf_size(buffer);
 }
 EXPORT_SYMBOL_GPL(ring_buffer_subbuf_size_get);
 
@@ -6814,7 +7078,8 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
 	struct buffer_page *bpage, *tmp;
-	int old_order, old_size;
+	unsigned int old_capacity;
+	int old_order;
 	int nr_pages;
 	int psize;
 	int err;
@@ -6822,9 +7087,6 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 
 	if (!buffer || order < 0)
 		return -EINVAL;
-
-	if (buffer->subbuf_order == order)
-		return 0;
 
 	psize = (1 << order) * PAGE_SIZE;
 	if (psize <= BUF_PAGE_HDR_SIZE)
@@ -6834,18 +7096,21 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 	if (psize > RB_WRITE_MASK + 1)
 		return -EINVAL;
 
-	old_order = buffer->subbuf_order;
-	old_size = buffer->subbuf_size;
-
 	/* prevent another thread from changing buffer sizes */
 	guard(mutex)(&buffer->mutex);
+
+	old_order = buffer->subbuf_order;
+	if (old_order == order)
+		return 0;
+
+	old_capacity = rb_subbuf_capacity(buffer);
+
 	atomic_inc(&buffer->record_disabled);
 
 	/* Make sure all commits have finished */
 	synchronize_rcu();
 
 	buffer->subbuf_order = order;
-	buffer->subbuf_size = psize - BUF_PAGE_HDR_SIZE;
 
 	/* Make sure all new buffers are allocated, before deleting the old ones */
 	for_each_buffer_cpu(buffer, cpu) {
@@ -6861,8 +7126,8 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 		}
 
 		/* Update the number of pages to match the new size */
-		nr_pages = old_size * buffer->buffers[cpu]->nr_pages;
-		nr_pages = DIV_ROUND_UP(nr_pages, buffer->subbuf_size);
+		nr_pages = old_capacity * buffer->buffers[cpu]->nr_pages;
+		nr_pages = DIV_ROUND_UP(nr_pages, rb_subbuf_capacity(buffer));
 
 		/* we need a minimum of two pages */
 		if (nr_pages < 2)
@@ -6948,7 +7213,6 @@ int ring_buffer_subbuf_order_set(struct trace_buffer *buffer, int order)
 
 error:
 	buffer->subbuf_order = old_order;
-	buffer->subbuf_size = old_size;
 
 	atomic_dec(&buffer->record_disabled);
 
@@ -6998,29 +7262,35 @@ static void rb_setup_ids_meta_page(struct ring_buffer_per_cpu *cpu_buffer,
 	struct trace_buffer_meta *meta = cpu_buffer->meta_page;
 	unsigned int nr_subbufs = cpu_buffer->nr_pages + 1;
 	struct buffer_page *first_subbuf, *subbuf;
+	int cnt = 0;
 	int id = 0;
 
-	subbuf_ids[id] = (unsigned long)cpu_buffer->reader_page->page;
-	cpu_buffer->reader_page->id = id++;
+	id = rb_page_id(cpu_buffer, cpu_buffer->reader_page, id);
+	subbuf_ids[id++] = (unsigned long)cpu_buffer->reader_page->page;
+	cnt++;
 
 	first_subbuf = subbuf = rb_set_head_page(cpu_buffer);
 	do {
+		id = rb_page_id(cpu_buffer, subbuf, id);
+
 		if (WARN_ON(id >= nr_subbufs))
 			break;
 
 		subbuf_ids[id] = (unsigned long)subbuf->page;
-		subbuf->id = id;
 
 		rb_inc_page(&subbuf);
 		id++;
+		cnt++;
 	} while (subbuf != first_subbuf);
+
+	WARN_ON(cnt != nr_subbufs);
 
 	/* install subbuf ID to kern VA translation */
 	cpu_buffer->subbuf_ids = subbuf_ids;
 
 	meta->meta_struct_len = sizeof(*meta);
 	meta->nr_subbufs = nr_subbufs;
-	meta->subbuf_size = cpu_buffer->buffer->subbuf_size + BUF_PAGE_HDR_SIZE;
+	meta->subbuf_size = rb_subbuf_size(cpu_buffer->buffer);
 	meta->meta_page_size = meta->subbuf_size;
 
 	rb_update_meta_page(cpu_buffer);
@@ -7274,6 +7544,27 @@ unlock:
 	return err;
 }
 
+/*
+ * This is called when a VMA is duplicated (e.g., on fork()) to increment
+ * the user_mapped counter without remapping pages.
+ */
+void ring_buffer_map_dup(struct trace_buffer *buffer, int cpu)
+{
+	struct ring_buffer_per_cpu *cpu_buffer;
+
+	if (WARN_ON(!cpumask_test_cpu(cpu, buffer->cpumask)))
+		return;
+
+	cpu_buffer = buffer->buffers[cpu];
+
+	guard(mutex)(&cpu_buffer->mapping_lock);
+
+	if (cpu_buffer->user_mapped)
+		__rb_inc_dec_mapped(cpu_buffer, true);
+	else
+		WARN(1, "Unexpected buffer stat, it should be mapped");
+}
+
 int ring_buffer_unmap(struct trace_buffer *buffer, int cpu)
 {
 	struct ring_buffer_per_cpu *cpu_buffer;
@@ -7376,7 +7667,7 @@ consume:
 			 * missed events, then record it there.
 			 */
 			commit = rb_page_size(reader);
-			if (buffer->subbuf_size - commit >= sizeof(missed_events)) {
+			if (rb_subbuf_capacity(buffer) - commit >= sizeof(missed_events)) {
 				memcpy(&bpage->data[commit], &missed_events,
 				       sizeof(missed_events));
 				local_add(RB_MISSED_STORED, &bpage->commit);
@@ -7408,7 +7699,7 @@ consume:
 out:
 	/* Some archs do not have data cache coherency between kernel and user-space */
 	flush_kernel_vmap_range(cpu_buffer->reader_page->page,
-				buffer->subbuf_size + BUF_PAGE_HDR_SIZE);
+				rb_subbuf_size(buffer));
 
 	rb_update_meta_page(cpu_buffer);
 

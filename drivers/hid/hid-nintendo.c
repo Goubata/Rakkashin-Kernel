@@ -823,7 +823,7 @@ static void joycon_wait_for_input_report(struct joycon_ctlr *ctlr)
 #define JC_INPUT_REPORT_MAX_DELTA	17
 #define JC_SUBCMD_TX_OFFSET_MS		4
 #define JC_SUBCMD_VALID_DELTA_REQ	3
-#define JC_SUBCMD_RATE_MAX_ATTEMPTS	500
+#define JC_SUBCMD_RATE_MAX_ATTEMPTS	25
 #define JC_SUBCMD_RATE_LIMITER_USB_MS	20
 #define JC_SUBCMD_RATE_LIMITER_BT_MS	60
 #define JC_SUBCMD_RATE_LIMITER_MS(ctlr)	((ctlr)->hdev->bus == BUS_USB ? JC_SUBCMD_RATE_LIMITER_USB_MS : JC_SUBCMD_RATE_LIMITER_BT_MS)
@@ -2424,7 +2424,7 @@ static int joycon_read_info(struct joycon_ctlr *ctlr)
 	struct joycon_input_report *report;
 
 	req.subcmd_id = JC_SUBCMD_REQ_DEV_INFO;
-	ret = joycon_send_subcmd(ctlr, &req, 0, HZ);
+	ret = joycon_send_subcmd(ctlr, &req, 0, 2 * HZ);
 	if (ret) {
 		hid_err(ctlr->hdev, "Failed to get joycon info; ret=%d\n", ret);
 		return ret;

@@ -49,6 +49,7 @@
 #include <linux/sched/mm.h>
 #include <linux/ksm.h>
 #include <linux/memfd.h>
+#include <linux/wrapfd.h>
 
 #include <linux/uaccess.h>
 #include <asm/cacheflush.h>
@@ -375,8 +376,8 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 
 	if (file) {
 		struct inode *inode = file_inode(file);
-		unsigned int seals = memfd_file_seals(file);
 		unsigned long flags_mask;
+		int err;
 
 		if (!file_mmap_ok(file, inode, pgoff, len))
 			return -EOVERFLOW;
@@ -418,8 +419,6 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			vm_flags |= VM_SHARED | VM_MAYSHARE;
 			if (!(file->f_mode & FMODE_WRITE))
 				vm_flags &= ~(VM_MAYWRITE | VM_SHARED);
-			else if (is_readonly_sealed(seals, vm_flags))
-				vm_flags &= ~VM_MAYWRITE;
 			fallthrough;
 		case MAP_PRIVATE:
 			if (!(file->f_mode & FMODE_READ))
@@ -439,6 +438,14 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		default:
 			return -EINVAL;
 		}
+
+		/*
+		 * Check to see if we are violating any seals and update VMA
+		 * flags if necessary to avoid future seal violations.
+		 */
+		err = memfd_check_seals_mmap(file, &vm_flags);
+		if (err)
+			return (unsigned long)err;
 	} else {
 		switch (flags & MAP_TYPE) {
 		case MAP_SHARED:
@@ -1560,9 +1567,7 @@ expanded:
 
 	vm_stat_account(mm, vm_flags, pglen);
 	if (vm_flags & VM_LOCKED) {
-		if ((vm_flags & VM_SPECIAL) || vma_is_dax(vma) ||
-					is_vm_hugetlb_page(vma) ||
-					vma == get_gate_vma(current->mm))
+		if (!vma_supports_mlock(vma))
 			vm_flags_clear(vma, VM_LOCKED_MASK);
 		else
 			mm->locked_vm += pglen;
@@ -1788,6 +1793,14 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 		if (!next)
 			goto out;
 	}
+
+	/*
+	 * Remapping pages of the wrapfd is not supported since vma->vm_file
+	 * points to the file object representing the wrapped content and not
+	 * the wrapfd.
+	 */
+	if (unlikely(is_wrapfd_vma(vma)))
+		goto out;
 
 	ret = do_mmap(vma->vm_file, start, size,
 			prot, flags, 0, pgoff, &populate, NULL);

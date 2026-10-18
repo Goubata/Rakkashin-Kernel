@@ -12,6 +12,7 @@
 #include <kvm/iommu.h>
 #include <kvm/device.h>
 
+#include <nvhe/alloc.h>
 #include <nvhe/iommu.h>
 #include <nvhe/mem_protect.h>
 #include <nvhe/mm.h>
@@ -62,23 +63,34 @@ static inline bool kvm_iommu_is_ready(void)
 	return atomic_read_acquire(&kvm_iommu_idmap_initialized) == 1;
 }
 
-static bool kvm_iommu_donate_from_cma(phys_addr_t phys, unsigned long order)
+/*
+ * Return 1 if the donation can go in the block pool, 0 if the system pool and
+ * < 0 if it is invalid.
+ */
+static int kvm_iommu_donation_is_valid(phys_addr_t phys, unsigned long order)
 {
-	phys_addr_t end = phys + PAGE_SIZE * (1 << order);
+	phys_addr_t end = phys + PAGE_SIZE * (1UL << order);
+
+	if (order > MAX_PAGE_ORDER)
+		return -EINVAL;
 
 	if (end <= phys)
-		return false;
+		return -EINVAL;
+
+	if (!IS_ALIGNED(phys, PAGE_SIZE << order))
+		return -EINVAL;
+
+	if (phys >= cma_base + cma_size || end <= cma_base)
+		return 0;
+
+	/* overlaps the CMA region */
+	if (phys < cma_base || end > cma_base + cma_size)
+		return -EINVAL;
 
 	if (order != pmd_order)
-		return false;
+		return -EINVAL;
 
-	if (!IS_ALIGNED(phys, PMD_SIZE))
-		return false;
-
-	if (phys < cma_base || end > cma_base + cma_size)
-		return false;
-
-	return true;
+	return 1;
 }
 
 static struct hyp_pool *__get_empty_block_pool(phys_addr_t phys)
@@ -120,19 +132,22 @@ int kvm_iommu_refill(struct kvm_hyp_memcache *host_mc)
 		unsigned long order = FIELD_GET(~PAGE_MASK, tmp_mc.head);
 		phys_addr_t phys = tmp_mc.head & PAGE_MASK;
 		struct hyp_pool *pool = &iommu_system_pool;
-		u64 nr_pages;
+		bool block_pool;
 		void *addr;
+		int ret;
 
-		if (check_shl_overflow(1UL, order, &nr_pages) ||
-		    !IS_ALIGNED(phys, PAGE_SIZE << order))
-			return -EINVAL;
+		ret = kvm_iommu_donation_is_valid(phys, order);
+		if (ret < 0)
+			return ret;
+
+		block_pool = ret;
 
 		addr = admit_host_page(&tmp_mc, order);
 		if (!addr)
 			return -EINVAL;
 		*host_mc = tmp_mc;
 
-		if (kvm_iommu_donate_from_cma(phys, order)) {
+		if (block_pool) {
 			hyp_spin_lock(&__block_pools_lock);
 			pool = __get_empty_block_pool(phys);
 			hyp_spin_unlock(&__block_pools_lock);
@@ -153,57 +168,18 @@ int kvm_iommu_refill(struct kvm_hyp_memcache *host_mc)
 
 void kvm_iommu_reclaim(struct kvm_hyp_memcache *host_mc, int target)
 {
-	unsigned long prev_nr_pages = host_mc->nr_pages;
-	unsigned long block_pages = 1 << pmd_order;
-	int p = 0;
-
 	if (!kvm_iommu_ops)
 		return;
 
 	reclaim_hyp_pool(&iommu_system_pool, host_mc, target);
-
-	target -= host_mc->nr_pages - prev_nr_pages;
-
-	while (target > block_pages && p < MAX_BLOCK_POOLS) {
-		struct hyp_pool *pool = &iommu_block_pools[p];
-
-		hyp_spin_lock(&__block_pools_lock);
-
-		if (hyp_pool_free_pages(pool) == block_pages) {
-			reclaim_hyp_pool(pool, host_mc, block_pages);
-			hyp_pool_init_empty(pool, 1);
-			target -= block_pages;
-		}
-
-		hyp_spin_unlock(&__block_pools_lock);
-		p++;
-	}
 }
 
 int kvm_iommu_reclaimable(void)
 {
-	unsigned long reclaimable = 0;
-	int p;
-
 	if (!kvm_iommu_ops)
 		return 0;
 
-	reclaimable += hyp_pool_free_pages(&iommu_system_pool);
-
-	/*
-	 * This also accounts for blocks, allocated from the CMA region. This is
-	 * not exactly what the shrinker wants... but we need to have a way to
-	 * report this memory to the host.
-	 */
-
-	for (p = 0; p < MAX_BLOCK_POOLS; p++) {
-		unsigned long __free_pages = hyp_pool_free_pages(&iommu_block_pools[p]);
-
-		if (__free_pages == 1 << pmd_order)
-			reclaimable += __free_pages;
-	}
-
-	return reclaimable;
+	return hyp_pool_free_pages(&iommu_system_pool);
 }
 
 struct hyp_mgt_allocator_ops kvm_iommu_allocator_ops = {
@@ -253,7 +229,12 @@ static void *__kvm_iommu_alloc_pages(u8 order, struct hyp_pool **pool)
 			i = 0;
 	} while (i != last_block_pool);
 
-	WRITE_ONCE(__block_pools_available, 0);
+	/*
+	 * iommu_block_pools[] are only full when they can't handle the smallest
+	 * allocation possible.
+	 */
+	if (!order)
+		WRITE_ONCE(__block_pools_available, 0);
 
 	hyp_spin_unlock(&__block_pools_lock);
 
@@ -348,13 +329,13 @@ void kvm_iommu_reclaim_pages(void *p, u8 order)
 
 		if (phys >= pool->range_start && phys < pool->range_end) {
 			__kvm_iommu_reclaim_pages(pool, p, order);
+			WRITE_ONCE(__block_pools_available, 1);
 			hyp_spin_unlock(&__block_pools_lock);
 			return;
 		}
 	}
 
-	hyp_spin_lock(&__block_pools_lock);
-
+	hyp_spin_unlock(&__block_pools_lock);
 	WARN_ON(1);
 }
 
@@ -540,6 +521,9 @@ int kvm_iommu_free_domain(pkvm_handle_t domain_id)
 	struct pkvm_hyp_vcpu *hyp_vcpu = __get_vcpu();
 	struct pkvm_hyp_vm *vm = NULL;
 
+	if (domain_id == KVM_IOMMU_DOMAIN_IDMAP_ID)
+		return -EINVAL;
+
 	domain = handle_to_domain(domain_id);
 	if (!domain)
 		return -EINVAL;
@@ -658,22 +642,25 @@ int kvm_iommu_detach_dev_nested(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
 	}
 
 	domain = handle_to_domain(domain_id);
-	if (!domain || atomic_read(&domain->refs) <= 1) {
+	if (!domain || domain_get(domain)) {
 		ret = -EINVAL;
 		goto out_put_context;
 	}
 
 	idmap_domain = handle_to_domain(KVM_IOMMU_DOMAIN_IDMAP_ID);
-	if (!idmap_domain || atomic_read(&idmap_domain->refs) <= 1) {
+	if (!idmap_domain || domain_get(idmap_domain)) {
 		ret = -EINVAL;
-		goto out_put_context;
+		goto out_domain_put;
 	}
 
 	ret = kvm_iommu_ops->detach_dev_nested(iommu, domain, idmap_domain, endpoint_id, pasid);
-	if (ret)
-		goto out_put_context;
+	if (!ret) {
+		domain_put(idmap_domain);
+		domain_put(domain);
+	}
 
 	domain_put(idmap_domain);
+out_domain_put:
 	domain_put(domain);
 out_put_context:
 	pkvm_devices_put_context(iommu_id, endpoint_id);
@@ -782,14 +769,14 @@ int kvm_iommu_detach_dev(pkvm_handle_t iommu_id, pkvm_handle_t domain_id,
 		return ret;
 
 	domain = handle_to_domain(domain_id);
-	if (!domain || atomic_read(&domain->refs) <= 1) {
+	if (!domain || domain_get(domain)) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
 
 	ret = kvm_iommu_ops->detach_dev(iommu, domain, endpoint_id, pasid);
-	if (ret)
-		goto out_unlock;
+	if (!ret)
+		domain_put(domain);
 
 	domain_put(domain);
 
@@ -1184,4 +1171,28 @@ int kvm_iommu_iotlb_sync_map(pkvm_handle_t domain_id,
 	ret = kvm_iommu_ops->iotlb_sync_map(domain, iova, size);
 	domain_put(domain);
 	return ret;
+}
+
+int kvm_iommu_request_hyp_alloc(void)
+{
+	struct kvm_hyp_req *req;
+	struct pkvm_hyp_vcpu *hyp_vcpu = __get_vcpu();
+	size_t nr_pages = hyp_alloc_missing_donations();
+
+	if (!nr_pages)
+		return -ENOENT;
+
+	if (hyp_vcpu)
+		req = pkvm_hyp_req_reserve(hyp_vcpu, KVM_HYP_LAST_REQ);
+	else
+		req = this_cpu_ptr(&host_hyp_reqs);
+
+	if (!req || (req->type != KVM_HYP_LAST_REQ))
+		return -EBUSY;
+
+	req->type = KVM_HYP_REQ_TYPE_MEM;
+	req->mem.dest = REQ_MEM_DEST_HYP_ALLOC;
+	req->mem.nr_pages = nr_pages;
+	req->mem.sz_alloc = PAGE_SIZE;
+	return 0;
 }

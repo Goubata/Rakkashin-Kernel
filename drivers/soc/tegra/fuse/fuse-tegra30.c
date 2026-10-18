@@ -64,28 +64,6 @@ static u32 tegra30_fuse_read(struct tegra_fuse *fuse, unsigned int offset)
 	return value;
 }
 
-static void __init tegra30_fuse_add_randomness(void)
-{
-	u32 randomness[12];
-
-	randomness[0] = tegra_sku_info.sku_id;
-	randomness[1] = tegra_read_straps();
-	randomness[2] = tegra_read_chipid();
-	randomness[3] = tegra_sku_info.cpu_process_id << 16;
-	randomness[3] |= tegra_sku_info.soc_process_id;
-	randomness[4] = tegra_sku_info.cpu_speedo_id << 16;
-	randomness[4] |= tegra_sku_info.soc_speedo_id;
-	randomness[5] = tegra_fuse_read_early(FUSE_VENDOR_CODE);
-	randomness[6] = tegra_fuse_read_early(FUSE_FAB_CODE);
-	randomness[7] = tegra_fuse_read_early(FUSE_LOT_CODE_0);
-	randomness[8] = tegra_fuse_read_early(FUSE_LOT_CODE_1);
-	randomness[9] = tegra_fuse_read_early(FUSE_WAFER_ID);
-	randomness[10] = tegra_fuse_read_early(FUSE_X_COORDINATE);
-	randomness[11] = tegra_fuse_read_early(FUSE_Y_COORDINATE);
-
-	add_device_randomness(randomness, sizeof(randomness));
-}
-
 static void __init tegra30_fuse_init(struct tegra_fuse *fuse)
 {
 	fuse->read_early = tegra30_fuse_read_early;
@@ -95,8 +73,6 @@ static void __init tegra30_fuse_init(struct tegra_fuse *fuse)
 
 	if (fuse->soc->speedo_init)
 		fuse->soc->speedo_init(&tegra_sku_info);
-
-	tegra30_fuse_add_randomness();
 }
 #endif
 
@@ -644,7 +620,7 @@ const struct tegra_fuse_soc tegra186_fuse_soc = {
 };
 #endif
 
-#if defined(CONFIG_ARCH_TEGRA_194_SOC)
+#if defined(CONFIG_ARCH_TEGRA_194_SOC) || defined(CONFIG_ARCH_TEGRA_234_SOC)
 static const struct nvmem_cell_info tegra194_fuse_cells[] = {
 	{
 		.name = "xusb-pad-calibration",

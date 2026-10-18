@@ -8,7 +8,8 @@ CFLAGS_switch.nvhe.o += -Wno-override-init
 hyp-obj-y := timer-sr.o sysreg-sr.o debug-sr.o switch.o tlb.o hyp-init.o host.o \
 	 hyp-main.o hyp-smp.o psci-relay.o alloc.o early_alloc.o page_alloc.o \
 	 cache.o setup.o mm.o mem_protect.o sys_regs.o pkvm.o stacktrace.o ffa.o \
-	 serial.o alloc_mgt.o iommu/iommu.o power/hvc.o power/scmi.o device/device.o
+	 serial.o alloc_mgt.o iommu/iommu.o power/hvc.o power/scmi.o device/device.o \
+	 its_emulate.o
 hyp-obj-y += ../vgic-v3-sr.o ../aarch32.o ../vgic-v2-cpuif-proxy.o ../entry.o \
 	 ../fpsimd.o ../hyp-entry.o ../exception.o ../pgtable.o iommu/pviommu-host.o  iommu/pviommu.o \
 	 ../../../kernel/smccc-call.o
@@ -36,5 +37,6 @@ CFLAGS_REMOVE_trace.nvhe.o := -fpatchable-function-entry=3
 CFLAGS_REMOVE_events.nvhe.o := -fpatchable-function-entry=3
 CFLAGS_REMOVE_ftrace.nvhe.o := -fpatchable-function-entry=3
 CFLAGS_REMOVE_setup.nvhe.o := -fpatchable-function-entry=3
+CFLAGS_REMOVE_stacktrace.nvhe.o := -fpatchable-function-entry=3
 
 obj-y := kvm_nvhe.o
