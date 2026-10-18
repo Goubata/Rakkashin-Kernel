@@ -109,6 +109,10 @@
 #ifndef CONF
 #define CONF		"/data/adb/rakkashin/"	/* "gpu", "fas": "0" = off */
 #endif
+#ifndef LOGFILE
+#define LOGFILE		"/data/adb/rakkashin/rakkashin.log"	/* shared with the scripts */
+#endif
+#define LOG_MAX		65536
 
 #define TICK_MS		50
 #define IDLE_TICK_MS	500
@@ -196,19 +200,34 @@ static struct {
 	unsigned int fps;	/* target frame rate the detector settled on */
 	long last_jank;		/* ms */
 	unsigned long janks;	/* late frames that lifted the GPU cap */
-	unsigned long frames_late; /* all late-frame events */
+	unsigned long frames_late; /* all late-frame events since start */
+	unsigned long app_late;	/* late-frame events of the app being watched */
+	unsigned long app_events; /* all events of the app being watched */
 	long state_at;		/* ms of the last fas_state write */
 	int state_dirty;
 } fas = { .fd = -1, .ctx = -1 };
 
+/* to dmesg and to the module log, which survives the ring buffer wrapping */
 static void klog(const char *msg)
 {
 	int fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+	struct stat st;
+	char ts[32];
+	time_t now;
 
 	if (fd >= 0) {
 		dprintf(fd, "rk_gpud: %s\n", msg);
 		close(fd);
 	}
+	if (!stat(LOGFILE, &st) && st.st_size > LOG_MAX)
+		rename(LOGFILE, LOGFILE ".old");
+	fd = open(LOGFILE, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+	if (fd < 0)
+		return;
+	now = time(NULL);
+	strftime(ts, sizeof(ts), "%m-%d %H:%M:%S", localtime(&now));
+	dprintf(fd, "%s rk_gpud: %s\n", ts, msg);
+	close(fd);
 }
 
 static int read_text(const char *path, char *buf, size_t len)
@@ -689,24 +708,43 @@ out:
 	return ret;
 }
 
+/*
+ * fas_state for the WebUI and rk_diag.sh; while an app is watched it is
+ * rewritten every FAS_STATE_MS with the detector's own view (target fps,
+ * acquiring/degraded/paused, event sequence: seq=0 means no frame of the
+ * app has reached the probe yet).
+ */
 static void fas_write_state(long t)
 {
 	char tmp[] = FAS_STATE ".tmp";
-	int fd;
+	struct fas_state st = { .ctx_id = fas.ctx };
+	int fd, have = 0;
 
 	if (!fas.state_dirty || t - fas.state_at < FAS_STATE_MS)
 		return;
+	if (fas.ctx >= 0 && !ioctl(fas.fd, FAS_IOC_GET_STATE, &st))
+		have = 1;
 	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (fd < 0)
 		return;
-	dprintf(fd, "pid=%d fps=%u degraded=%d late=%lu gpu_lifts=%lu gpu_floor=%ld cut=%d\n",
+	dprintf(fd, "pid=%d fps=%u degraded=%d late=%lu gpu_lifts=%lu gpu_floor=%ld cut=%d"
+		" app_late=%lu app_events=%lu",
 		fas.ctx >= 0 ? fas.pid : 0, fas.ctx >= 0 ? fas.fps : 0,
 		fas.degraded, fas.frames_late, fas.janks,
-		floor_i ? steps[floor_i] : 0L, cut);
+		floor_i ? steps[floor_i] : 0L, cut, fas.app_late, fas.app_events);
+	if (have)
+		dprintf(fd, " det_fps=%u acquiring=%d det_degraded=%d paused=%d seq=%u dropped=%u",
+			st.fps, !!(st.flags & FAS_STATE_ACQUIRING),
+			!!(st.flags & FAS_STATE_DEGRADED), !!(st.flags & FAS_STATE_PAUSED),
+			st.seq, st.dropped);
+	else if (fas.ctx >= 0)
+		dprintf(fd, " det=gone");
+	dprintf(fd, "\n");
 	close(fd);
 	rename(tmp, FAS_STATE);
 	fas.state_at = t;
-	fas.state_dirty = 0;
+	/* keep refreshing while an app is watched */
+	fas.state_dirty = fas.ctx >= 0;
 }
 
 static void fas_unregister(void)
@@ -790,11 +828,23 @@ static void app_mem_switch(long uid)
 	}
 }
 
+/* process name, for the log */
+static const char *app_name(int pid)
+{
+	static char name[64];
+	char path[48];
+
+	snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+	if (read_text(path, name, sizeof(name)) || !name[0])
+		snprintf(name, sizeof(name), "?");
+	return name;
+}
+
 static void fas_register(int pid)
 {
 	struct fas_register_args a;
 	unsigned int i;
-	char msg[96];
+	char msg[128];
 
 	fas_unregister();
 	app_mem_switch(pid_uid(pid));
@@ -811,15 +861,20 @@ static void fas_register(int pid)
 	if (ioctl(fas.fd, FAS_IOC_REGISTER, &a)) {
 		/* gone already, or another FAS client watches it (EEXIST) */
 		if (errno != ESRCH) {
-			snprintf(msg, sizeof(msg), "frame timing for pid %d failed: %s",
-				 pid, strerror(errno));
+			snprintf(msg, sizeof(msg), "frame timing for %.40s (pid %d) failed: %s",
+				 app_name(pid), pid, strerror(errno));
 			klog(msg);
 		}
 		return;
 	}
 	fas.ctx = a.ctx_id;
 	fas.pid = pid;
+	fas.app_late = 0;
+	fas.app_events = 0;
+	fas.state_dirty = 1;
 	fas.last_jank = now_ms();	/* no probing until it proves healthy */
+	snprintf(msg, sizeof(msg), "watching frames of %.48s (pid %d)", app_name(pid), pid);
+	klog(msg);
 }
 
 static void fas_events(long t)
@@ -836,6 +891,9 @@ static void fas_events(long t)
 
 		if (fas.ctx < 0 || ev[i].ctx_id != fas.ctx)
 			continue;
+		fas.app_events++;
+		if (ev[i].fps)		/* every event carries the active target */
+			fas.fps = ev[i].fps;
 		switch (ev[i].type) {
 		case FAS_EVENT_SMALL_JANK:
 		case FAS_EVENT_BOOST_SOFT:
@@ -866,6 +924,7 @@ static void fas_events(long t)
 		}
 		if (level) {
 			fas.frames_late++;
+			fas.app_late++;
 			fas.last_jank = t;
 			if (level > worst)
 				worst = level;

@@ -73,6 +73,10 @@ for f in gpu_freq_table gpu_min_clock gpu_max_clock gpu_clock gpu_busy; do
 done
 echo "rk_gpud: $(pgrep -f rk_gpud || echo 'not running')"
 echo "encore_fas: $([ -e /dev/encore_fas ] && echo present || echo missing)"
+TP=$(cat $K/top_pid 2>/dev/null)
+echo "top app: $(tr '\0' ' ' < "/proc/$TP/cmdline" 2>/dev/null | cut -c1-80) (pid $TP)"
+echo "libgui probed: inode $(stat -c '%i' /system/lib64/libgui.so 2>&1)"
+echo "libgui in top app: $(grep -m3 'libgui' "/proc/$TP/maps" 2>/dev/null | awk '{print "inode", $5, $6}' | sort -u | tr '\n' ' ')"
 
 echo "== cpufreq"
 for p in /sys/devices/system/cpu/cpufreq/policy*; do
@@ -92,7 +96,7 @@ echo "== module log"
 tail -40 /data/adb/rakkashin/rakkashin.log 2>&1
 
 echo "== dmesg"
-dmesg | grep -iE 'rakkashin|rk_gpud|boeffla|avr_profile' | tail -40
+dmesg | grep -iE 'rakkashin|rk_gpud|boeffla|avr_profile|encore_fas' | tail -40
 } > "$OUT" 2>&1
 
 if [ -d "$COPY" ]; then
