@@ -316,6 +316,10 @@ extern s64 cpuidle_governor_latency_req(unsigned int cpu);
 ({									\
 	int __ret = 0;							\
 									\
+	/* work arrived meanwhile: don't go idle only to wake at once */\
+	if (need_resched())						\
+		return -1;						\
+									\
 	if (!idx) {							\
 		cpu_do_idle();						\
 		return idx;						\
