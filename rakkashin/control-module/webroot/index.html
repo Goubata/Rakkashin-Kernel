@@ -191,10 +191,10 @@ const T = {
     gpu_desc: "バッテリーとスマートバランスで、GPU を今の描画に必要な周波数までに抑えます。画面に触れるとすぐ解除されます（持続パフォーマンスで本体が温まっているときは、触れている間も抑えます）。足りなかった周波数は覚えて、その下には戻しません。",
     gpu_on: "GPU 効率化をオンにしました",
     fas_title: "フレーム監視（Encore FAS）",
-    fas_desc: "前面のアプリが1枚描くたびに時刻を測り、カクつきや、目標のフレームレートを下回っているのをその場で見つけます。CPU や GPU の上限が原因なら、すぐに上げて、その周波数を下限として覚えます。上限が原因でなければ何もしないので、電池を無駄にしません。",
+    fas_desc: "前面のアプリが1枚描くたびに時刻を測り、カクつきや、目標のフレームレートを下回っているのをその場で見つけます。CPU や GPU の上限が原因なら、すぐに上げて、その周波数を下限として覚えます。上限が原因でなければ何もしないので、電池を無駄にしません。カクつかない間は余裕を少しずつ減らし、アプリごとにちょうどいい所を学習して覚えます。",
     fas_on: "フレーム監視をオンにしました",
     fas_off: "フレーム監視をオフにしました",
-    fas_watch: (fps, late, gpu, cpu) => `監視中: ${fps ? fps + " fps" : "目標を判定中"} ・ カクつき ${late} 回 ・ 上限を上げた回数 GPU ${gpu} / CPU ${cpu}`,
+    fas_watch: (fps, late, gpu, cpu, cut) => `監視中: ${fps ? fps + " fps" : "目標を判定中"} ・ カクつき ${late} 回 ・ 上限を上げた回数 GPU ${gpu} / CPU ${cpu}${cut !== null ? ` ・ 学習で減らした余裕 ${cut} ポイント` : ""}`,
     fas_idle: "前面のアプリを待っています",
     gpu_off: "GPU 効率化をオフにしました",
     io_title: "ADIOS I/O スケジューラ",
@@ -262,10 +262,10 @@ const T = {
     gpu_desc: "In Battery and Smart Balanced, holds the GPU to the frequency the current frames need. Lifted the instant you touch (with Sustained performance on a warm phone, it stays on while you touch). A frequency that proved too low is remembered and not used again.",
     gpu_on: "GPU efficiency on",
     fas_title: "Frame timing (Encore FAS)",
-    fas_desc: "Times every frame of the app in front and spots stutter or a frame rate below its target as it happens. If a CPU or GPU cap caused it, the cap is raised at once and that frequency is remembered as a floor. If not, nothing changes, so no battery is wasted.",
+    fas_desc: "Times every frame of the app in front and spots stutter or a frame rate below its target as it happens. If a CPU or GPU cap caused it, the cap is raised at once and that frequency is remembered as a floor. If not, nothing changes, so no battery is wasted. While frames stay on time the headroom is trimmed bit by bit, and each app's sweet spot is learned and remembered.",
     fas_on: "Frame timing on",
     fas_off: "Frame timing off",
-    fas_watch: (fps, late, gpu, cpu) => `Watching: ${fps ? fps + " fps" : "finding the target"} · ${late} late frames · caps raised GPU ${gpu} / CPU ${cpu}`,
+    fas_watch: (fps, late, gpu, cpu, cut) => `Watching: ${fps ? fps + " fps" : "finding the target"} · ${late} late frames · caps raised GPU ${gpu} / CPU ${cpu}${cut !== null ? ` · learned headroom trim ${cut} points` : ""}`,
     fas_idle: "Waiting for an app in front",
     gpu_off: "GPU efficiency off",
     io_title: "ADIOS I/O scheduler",
@@ -558,8 +558,8 @@ async function init() {
       if (!fas.checked) { el.textContent = ""; return; }
       const r = (await exec(`cat ${STATE}/fas_state 2>/dev/null; cat ${NODE}/frame_state`)).stdout;
       const m = r.match(/pid=(\d+) fps=(\d+) degraded=\d late=(\d+) gpu_lifts=(\d+)/);
-      const k = r.match(/janks=(\d+)/);
-      el.textContent = m && m[1] !== "0" ? T.fas_watch(Number(m[2]), m[3], m[4], k ? k[1] : "0") : T.fas_idle;
+      const k = r.match(/janks=(\d+)(?: cut=(\d+))?/);
+      el.textContent = m && m[1] !== "0" ? T.fas_watch(Number(m[2]), m[3], m[4], k ? k[1] : "0", k && k[2] !== undefined ? k[2] : null) : T.fas_idle;
     };
     showFas();
     setInterval(() => { if (!document.hidden) showFas(); }, 3000);

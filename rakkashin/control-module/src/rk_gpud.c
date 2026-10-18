@@ -47,9 +47,11 @@
  * lifts the cap at once (to the top for a bad one) and learns a floor; a
  * jank that the cap didn't cause changes nothing. While frames fall short
  * of their rate the cap never comes down. While frames are timed a late one
- * is caught at once, so the cap runs with FAS_HEADROOM_CUT points less
- * headroom. The kernel gets the same events directly and does the same for
- * the CPU caps.
+ * is caught at once, so the headroom is trimmed adaptively: a point less
+ * after every CUT_STEP_MS of on-time frames (up to CUT_MAX), CUT_BACK points
+ * back whenever the GPU cap held a frame back. What was learned (floor and
+ * trim) is remembered for the last APP_MEMORY apps by UID. The kernel gets
+ * the same events directly and does the same for the CPU caps.
  *
  * Either part can be turned off: "0" in CONF "gpu" (GPU caps) or CONF "fas"
  * (frame timing); with GPU caps off it only keeps the foreground app
@@ -132,8 +134,13 @@
 #define REG_DELAY_MS	500	/* let a foreground switch settle before probing */
 #define JANK_BOUND_PCT	90	/* the GPU ran this close to the cap: it held the frame */
 #define FAS_STATE_MS	2000	/* write fas_state at most this often */
-#define FAS_HEADROOM_CUT 10	/* less headroom while frames are timed */
-#define FAS_TOUCH_HEADROOM_MIN 30	/* touched floor of that, see TOUCH_HEADROOM_MIN */
+#define FAS_TOUCH_HEADROOM_MIN 30	/* touched floor of the trim, see TOUCH_HEADROOM_MIN */
+#define FAS_HEADROOM_MIN 10	/* untouched floor of the trim */
+#define CUT_START	5	/* headroom trim for an app we haven't seen */
+#define CUT_MAX		20
+#define CUT_BACK	10
+#define CUT_STEP_MS	5000
+#define APP_MEMORY	8
 
 static long steps[MAX_STEPS];	/* MHz, ascending */
 static int nsteps;
@@ -165,6 +172,18 @@ static long floor_work;		/* busy% x MHz when the floor was learned */
 static long idle_since = -1;	/* when the GPU went nearly idle (ms) */
 
 /* frame timing (encore_fas) */
+/* adaptive headroom trim while frames are timed */
+static int cut = CUT_START;
+static long cut_since;		/* ms of the last trim step or jank */
+
+/* what was learned per app, by UID */
+static struct {
+	long uid;		/* -1 = free */
+	int floor_i, cut;
+	long floor_hold, floor_work, used;
+} app_mem[APP_MEMORY] = { [0 ... APP_MEMORY - 1] = { .uid = -1 } };
+static long mem_uid = -1;	/* UID whose state is live */
+
 static struct {
 	int fd;			/* /dev/encore_fas, -1 = off */
 	uint64_t offset;	/* Surface::queueBuffer in LIBGUI */
@@ -358,8 +377,16 @@ static long touch_headroom(int timed)
 		return TOUCH_HEADROOM_PCT;
 	hr = strtol(p + 9, NULL, 10);
 	if (timed)
-		hr -= FAS_HEADROOM_CUT;
+		hr -= cut;
 	return hr > min ? hr : min;
+}
+
+/* untouched headroom: trimmed while frames are timed */
+static long idle_headroom(int timed)
+{
+	long hr = timed ? HEADROOM_PCT - cut : HEADROOM_PCT;
+
+	return hr > FAS_HEADROOM_MIN ? hr : FAS_HEADROOM_MIN;
 }
 
 /* frames of the app in front are being timed right now */
@@ -494,10 +521,16 @@ static void gov_tick(void)
 	g.work = busy * avg;
 
 	/* frequency the current work needs, plus headroom */
+	/* frames on time for another CUT_STEP_MS: a point less headroom */
+	if (frames_timed() && !fas.degraded && t - cut_since >= CUT_STEP_MS &&
+	    t - fas.last_jank >= CUT_STEP_MS) {
+		cut_since = t;
+		if (cut < CUT_MAX)
+			cut++;
+	}
 	want = step_for(avg * busy / 100 *
 			(100 + (touched ? touch_headroom(frames_timed()) :
-				frames_timed() ? HEADROOM_PCT - FAS_HEADROOM_CUT :
-				HEADROOM_PCT)) / 100);
+				idle_headroom(frames_timed()))) / 100);
 
 	floor_age(busy, g.work, t);
 	if (want < floor_i)
@@ -555,6 +588,9 @@ static void gov_jank(int level, long t)
 	if (g.last_clk * 100 < steps[g.cap] * JANK_BOUND_PCT)
 		return;
 	floor_learn(g.cap, g.work, t);
+	/* the cap held a frame back: give headroom back at once */
+	cut = cut > CUT_BACK ? cut - CUT_BACK : 0;
+	cut_since = t;
 	g.cap = level > 1 ? nsteps - 1 :
 		g.cap + 2 < nsteps ? g.cap + 2 : nsteps - 1;
 	g.low = 0;
@@ -663,10 +699,10 @@ static void fas_write_state(long t)
 	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
 	if (fd < 0)
 		return;
-	dprintf(fd, "pid=%d fps=%u degraded=%d late=%lu gpu_lifts=%lu gpu_floor=%ld\n",
+	dprintf(fd, "pid=%d fps=%u degraded=%d late=%lu gpu_lifts=%lu gpu_floor=%ld cut=%d\n",
 		fas.ctx >= 0 ? fas.pid : 0, fas.ctx >= 0 ? fas.fps : 0,
 		fas.degraded, fas.frames_late, fas.janks,
-		floor_i ? steps[floor_i] : 0L);
+		floor_i ? steps[floor_i] : 0L, cut);
 	close(fd);
 	rename(tmp, FAS_STATE);
 	fas.state_at = t;
@@ -694,6 +730,66 @@ static void fas_unregister(void)
  */
 static const unsigned int fas_rates[] = { 144, 120, 90, 72, 60, 45, 40, 30 };
 
+/* UID of a process, -1 if gone */
+static long pid_uid(int pid)
+{
+	char path[64], st[512], *u;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", pid);
+	if (pid <= 0 || read_text(path, st, sizeof(st)))
+		return -1;
+	u = strstr(st, "\nUid:");
+	return u ? atol(u + 5) : -1;
+}
+
+/* the app in front changed: keep what was learned, restore what we know */
+static void app_mem_switch(long uid)
+{
+	int i, slot = -1, lru = 0;
+	long t = now_ms();
+
+	if (mem_uid >= 0) {
+		for (i = 0; i < APP_MEMORY; i++)
+			if (app_mem[i].uid == mem_uid)
+				slot = i;
+		if (slot < 0) {
+			for (i = 0; i < APP_MEMORY; i++) {
+				if (app_mem[i].uid < 0) {
+					lru = i;
+					break;
+				}
+				if (app_mem[i].used < app_mem[lru].used)
+					lru = i;
+			}
+			slot = lru;
+		}
+		app_mem[slot].uid = mem_uid;
+		app_mem[slot].floor_i = floor_i;
+		app_mem[slot].floor_hold = floor_hold;
+		app_mem[slot].floor_work = floor_work;
+		app_mem[slot].cut = cut;
+		app_mem[slot].used = t;
+	}
+	mem_uid = uid;
+	floor_i = 0;
+	floor_hold = FLOOR_HOLD_MS;
+	floor_work = 0;
+	cut = CUT_START;
+	cut_since = t;
+	for (i = 0; uid >= 0 && i < APP_MEMORY; i++) {
+		if (app_mem[i].uid != uid)
+			continue;
+		floor_i = app_mem[i].floor_i < nsteps ? app_mem[i].floor_i : 0;
+		floor_hold = app_mem[i].floor_hold;
+		floor_work = app_mem[i].floor_work;
+		cut = app_mem[i].cut;
+		app_mem[i].used = t;
+		/* a fresh hold: the scene may differ from when it was saved */
+		floor_until = t + FLOOR_HOLD_MS;
+		break;
+	}
+}
+
 static void fas_register(int pid)
 {
 	struct fas_register_args a;
@@ -701,9 +797,7 @@ static void fas_register(int pid)
 	char msg[96];
 
 	fas_unregister();
-	/* a new app: what was learned holds for the old one */
-	floor_i = 0;
-	floor_hold = FLOOR_HOLD_MS;
+	app_mem_switch(pid_uid(pid));
 	if (pid <= 0)
 		return;
 

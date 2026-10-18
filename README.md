@@ -1,6 +1,6 @@
 # Rakkashin Kernel
 
-Custom GKI kernel for **avr / avr_retcn** (Android 16, `android16-6.12`, 6.12.58)
+Custom GKI kernel for **avr / avr_retcn** (Android 16, `android16-6.12`, 6.12.113)
 with KernelSU-Next and a set of performance, efficiency and battery features,
 controlled from a KernelSU WebUI.
 
@@ -11,7 +11,16 @@ by **Rakkashin**
 ## Features
 
 **Root**
-- KernelSU-Next v3.4.1 (no SUSFS: it broke Chrome and every WebUI on this device)
+- KernelSU-Next v3.4.2 (no SUSFS: it broke Chrome and every WebUI on this device)
+
+**Base**
+- android16-6.12 GKI at 6.12.93 (Google's tree, KMI-stable), plus Linux
+  stable up to 6.12.113 commit by commit wherever it keeps the KMI and the
+  files aren't ones Google maintains itself (those follow Google's merges).
+  Every kernel symbol CRC the stock vendor/system modules need is checked.
+- Efficiency backports from Linux 7.3 (nohz, timers, block merge) and from
+  Sultan's Pixel kernel (freezer timeout, kernfs/SELinux allocation-free
+  paths, unbound RCU GP workers, no idle entry with work pending).
 
 **Profiles** — `/sys/kernel/avr_profile/mode`, switched from the WebUI
 
@@ -71,6 +80,14 @@ by **Rakkashin**
   around it, and a stutter the caps didn't cause costs no power. While
   frames are timed, the caps run with 10 points less headroom, since a late
   frame is caught at once. WebUI toggle, default on.
+- **Learns each app**: while frames are timed, the headroom is trimmed a
+  point every 5 s of on-time frames (up to 20) and given back 10 points the
+  moment a cap holds a frame back, so each game settles at the least
+  headroom it tolerates. Floors and trim are remembered for the last 8
+  apps by UID, on the CPU (kernel) and GPU (rk_gpud) side.
+- **OPP-exact caps**: demand caps are rounded up to the next real OPP (a
+  cap between two OPPs used to mean the lower one) and never set below the
+  cluster's most energy-efficient OPP from the Energy Model.
 - **No hunting**: without frame timing too, the GPU cap remembers a step
   that saturated and checks every fall (at a lower clock the same work must
   look proportionally busier; clearly busier means frames stopped fitting),
@@ -174,7 +191,7 @@ GPL-2.0, like the Linux kernel. See `COPYING`.
 
 ## 日本語
 
-avr / avr_retcn 向けのカスタム GKI カーネルです（Android 16、6.12.58）。
+avr / avr_retcn 向けのカスタム GKI カーネルです（Android 16、6.12.113）。
 KernelSU-Next と、性能・効率・電池持ちのための独自機能を入れています。
 設定は KernelSU の WebUI から行います。
 

@@ -59,9 +59,20 @@
  * twice as long each time it is hit again (up to 2 min), then probed 5% of
  * max lower every 5 s while frames stay on time. So the caps settle just
  * above what each game really needs instead of hunting around it, and a
- * jank that our caps didn't cause costs no power at all. While frames are
- * being timed, a late one is caught within a frame, so the caps run with
- * FAS_HEADROOM_CUT points less headroom.
+ * jank that our caps didn't cause costs no power at all.
+ *
+ * While frames are timed, a late one is caught within a frame, so the
+ * headroom is trimmed adaptively (additive increase, multiplicative
+ * decrease): one point less after every 5 s with no cap-caused jank, up to
+ * FAS_CUT_MAX, and FAS_CUT_BACK points back at once when our caps held a
+ * frame back. Each app converges to the least headroom its frames tolerate.
+ * The learned floors and the trim are remembered for the last APP_MEMORY
+ * apps (by UID), so returning to a game starts where it left off.
+ *
+ * The demand cap is rounded up to the next real OPP (a QoS max between two
+ * OPPs means the one below, which would eat the headroom) and never set
+ * below the policy's most energy-efficient OPP (lowest EM cost: running
+ * slower than that costs more energy per unit of work, not less).
  *
  * CPU frequency is steered only through cpufreq's frequency QoS, the same
  * mechanism thermal mitigation uses. QoS takes the lowest max request and
@@ -89,7 +100,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.8 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v2.9 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -153,9 +164,13 @@ struct avr_policy_reqs {
 	s32 jfloor;		/* learned from late frames, kHz; 0 = none */
 	unsigned int jticks;	/* ticks until the floor is probed lower */
 	unsigned int jhold;	/* hold of the floor, doubles on repeat */
+	unsigned int eff_khz;	/* most energy-efficient OPP, 0 = not known yet */
 };
 
 /* indexed by policy->cpu, the policy's owning CPU */
+#ifndef NO_UID
+#define NO_UID			((uid_t)-1)
+#endif
 static struct avr_policy_reqs reqs[NR_CPUS];
 /* per-CPU idle time at the last demand tick, for windowed busy */
 static u64 win_wall[NR_CPUS], win_idle[NR_CPUS];
@@ -207,8 +222,22 @@ static bool fas_reset;				/* foreground app changed: forget floors */
 static pid_t top_pid;				/* foreground app process */
 static unsigned long fas_seen;			/* jiffies of the last timed frame */
 #define FAS_SEEN_MS		1000	/* frames timed this recently: timing is live */
-#define FAS_HEADROOM_CUT	10	/* less headroom while frames are timed */
-#define FAS_HEADROOM_MIN	15
+#define FAS_HEADROOM_MIN	10	/* never trim headroom below this */
+#define FAS_CUT_START		5	/* headroom trim for an app we haven't seen */
+#define FAS_CUT_MAX		20
+#define FAS_CUT_BACK		10	/* given back when our caps held a frame */
+#define FAS_CUT_STEP_TICKS	250	/* 5 s of on-time frames per point */
+static unsigned int fas_cut = FAS_CUT_START;	/* headroom trim, points */
+static unsigned int fas_clean_ticks;
+static uid_t top_uid = NO_UID;			/* UID of top_pid */
+static uid_t mem_uid = NO_UID;			/* UID whose state is live */
+#define APP_MEMORY		8
+static struct {
+	uid_t uid;				/* NO_UID = free */
+	unsigned int cut;
+	unsigned long used;			/* jiffies, for LRU */
+	s32 jfloor[NR_CPUS];			/* by policy owner CPU */
+} app_mem[APP_MEMORY] = { [0 ... APP_MEMORY - 1] = { .uid = NO_UID } };
 #define DEMAND_FLOOR_PCT	30	/* never cap below this share of max */
 #define DEMAND_FALL_TICKS	5	/* need must stay low this long before lowering */
 #define DEMAND_SAT_PCT		90	/* a CPU this busy at the cap is saturated */
@@ -227,7 +256,6 @@ static DEFINE_MUTEX(avr_lock);
 static struct kobject *avr_kobj;
 
 #define MAX_APP_PROFILES	64
-#define NO_UID			((uid_t)-1)
 /* each entry is (uid << 8 | mode), so lockless readers see whole entries */
 static u64 app_profiles[MAX_APP_PROFILES];
 static unsigned int nr_app_profiles;
@@ -287,6 +315,49 @@ static s32 battery_cap(struct cpufreq_policy *policy, unsigned int pct,
 	return clamp_t(s32, knee, pct_of(fmax, EFF_MIN_PCT), pct_of(fmax, EFF_MAX_PCT));
 }
 
+/*
+ * Frequency (kHz) of the policy's lowest-cost Energy Model state: the most
+ * work per joule. 0 without a usable EM. Cached; the EM doesn't change.
+ */
+static unsigned int efficient_khz(struct cpufreq_policy *policy)
+{
+	struct avr_policy_reqs *r = &reqs[policy->cpu];
+	struct em_perf_domain *pd;
+	struct em_perf_state *table;
+	unsigned long best = ULONG_MAX, f = 0;
+	int i, n;
+
+	if (r->eff_khz)
+		return r->eff_khz == UINT_MAX ? 0 : r->eff_khz;
+	pd = em_cpu_get(policy->cpu);
+	if (!pd || em_is_artificial(pd)) {
+		r->eff_khz = UINT_MAX;		/* remember: none */
+		return 0;
+	}
+	rcu_read_lock();
+	table = em_perf_state_from_pd(pd);
+	n = em_pd_nr_perf_states(pd);
+	for (i = 0; i < n; i++)
+		if (table[i].cost && table[i].cost < best) {
+			best = table[i].cost;
+			f = table[i].frequency;
+		}
+	rcu_read_unlock();
+	r->eff_khz = f ? f : UINT_MAX;
+	return f;
+}
+
+/* lowest real OPP >= khz, so a QoS max between two OPPs isn't rounded down */
+static s32 opp_ceil(struct cpufreq_policy *policy, s32 khz)
+{
+	int idx;
+
+	if (!policy->freq_table || khz <= 0)
+		return khz;
+	idx = cpufreq_table_find_index_al(policy, khz, false);
+	return idx >= 0 ? (s32)policy->freq_table[idx].frequency : khz;
+}
+
 /* touched with sustained performance and the cap engaged */
 static bool sustained_engaged(void)
 {
@@ -331,7 +402,9 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 	unsigned int fmax = policy->cpuinfo.max_freq;
 	unsigned int khz = READ_ONCE(policy->cur);
 	bool touched = smart_lifted;
-	s32 floor = pct_of(fmax, DEMAND_FLOOR_PCT);
+	/* never below the most efficient OPP (clamped to a sane share of max) */
+	s32 floor = max_t(s32, pct_of(fmax, DEMAND_FLOOR_PCT),
+			  min_t(s32, efficient_khz(policy), pct_of(fmax, 60)));
 	s32 cur, limit;
 	unsigned long need = 0;
 	bool saturated = false;
@@ -381,8 +454,8 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 	}
 	headroom = touched ? touch_headroom() : DEMAND_HEADROOM_PCT;
 	if (time_before(jiffies, READ_ONCE(fas_seen) + msecs_to_jiffies(FAS_SEEN_MS)))
-		headroom = headroom > FAS_HEADROOM_MIN + FAS_HEADROOM_CUT ?
-			   headroom - FAS_HEADROOM_CUT :
+		headroom = headroom > FAS_HEADROOM_MIN + fas_cut ?
+			   headroom - fas_cut :
 			   min_t(unsigned int, headroom, FAS_HEADROOM_MIN);
 	want = clamp_t(s32, need * (100 + headroom) / 100, floor, fmax);
 
@@ -456,7 +529,7 @@ static void apply_policy(struct cpufreq_policy *policy,
 	if (m->smart && idle && smart_cap < 100)
 		max = min(max, pct_of(fmax, smart_cap));
 	if (m->demand && demand_on && r->dcap && r->dcap != DCAP_TOP)
-		max = min(max, r->dcap);
+		max = min(max, opp_ceil(policy, r->dcap));
 	if (power_pct < 100)
 		max = min(max, pct_of(fmax, power_pct));
 	if (max >= (s32)fmax)
@@ -768,6 +841,82 @@ static void power_update(unsigned int limit, bool measured, unsigned int mw)
 }
 
 /*
+ * Adaptive headroom trim, once per tick with avr_lock held: a point less per
+ * FAS_CUT_STEP_TICKS of timed frames without a cap-caused jank, FAS_CUT_BACK
+ * back when our caps held a frame back (@lifted).
+ */
+static void fas_trim(bool lifted)
+{
+	if (lifted) {
+		fas_cut = fas_cut > FAS_CUT_BACK ? fas_cut - FAS_CUT_BACK : 0;
+		fas_clean_ticks = 0;
+		return;
+	}
+	if (!time_before(jiffies, READ_ONCE(fas_seen) + msecs_to_jiffies(FAS_SEEN_MS)))
+		return;			/* not timing frames: nothing learned */
+	if (++fas_clean_ticks >= FAS_CUT_STEP_TICKS) {
+		fas_clean_ticks = 0;
+		if (fas_cut < FAS_CUT_MAX)
+			fas_cut++;
+	}
+}
+
+/*
+ * The app in front changed (avr_lock held): keep what was learned for the
+ * one leaving, restore what we know of the one arriving.
+ */
+static void app_mem_switch(uid_t uid)
+{
+	int i, slot = -1, lru = 0;
+	unsigned int cpu;
+
+	if (mem_uid != NO_UID) {
+		for (i = 0; i < APP_MEMORY; i++)
+			if (app_mem[i].uid == mem_uid)
+				slot = i;
+		if (slot < 0) {
+			for (i = 0; i < APP_MEMORY; i++) {
+				if (app_mem[i].uid == NO_UID) {
+					lru = i;
+					break;
+				}
+				if (time_before(app_mem[i].used, app_mem[lru].used))
+					lru = i;
+			}
+			slot = lru;
+		}
+		app_mem[slot].uid = mem_uid;
+		app_mem[slot].cut = fas_cut;
+		app_mem[slot].used = jiffies;
+		for_each_possible_cpu(cpu)
+			app_mem[slot].jfloor[cpu] = reqs[cpu].jfloor;
+	}
+
+	mem_uid = uid;
+	fas_cut = FAS_CUT_START;
+	fas_clean_ticks = 0;
+	for_each_possible_cpu(cpu) {
+		reqs[cpu].jfloor = 0;
+		reqs[cpu].jhold = 0;
+	}
+	if (uid == NO_UID)
+		return;
+	for (i = 0; i < APP_MEMORY; i++) {
+		if (app_mem[i].uid != uid)
+			continue;
+		fas_cut = app_mem[i].cut;
+		app_mem[i].used = jiffies;
+		for_each_possible_cpu(cpu) {
+			reqs[cpu].jfloor = app_mem[i].jfloor[cpu];
+			/* a fresh hold: the scene may differ from when it was saved */
+			reqs[cpu].jticks = JFLOOR_HOLD_TICKS;
+			reqs[cpu].jhold = JFLOOR_HOLD_TICKS;
+		}
+		break;
+	}
+}
+
+/*
  * Skin temperature in milli-degC: the hotter of the front and back virtual
  * sensors, or NO_TEMP if there are none. May sleep; once a second at most.
  */
@@ -791,7 +940,7 @@ static int skin_temp(void)
 static void gov_fn(struct work_struct *work)
 {
 	unsigned int limit = READ_ONCE(power_limit_mw);
-	unsigned int mw = 0, cpu, jank;
+	unsigned int mw = 0, cpu, jank, janks_before;
 	/* tick 1 after a (re)set measures at once, then every POWER_EVERY */
 	bool measure = limit && ++power_tick % POWER_EVERY == 1;
 	bool tmeasure = READ_ONCE(sustained) && temp_tick++ % TEMP_EVERY == 0;
@@ -811,8 +960,7 @@ static void gov_fn(struct work_struct *work)
 	mutex_lock(&avr_lock);
 	if (READ_ONCE(fas_reset)) {
 		WRITE_ONCE(fas_reset, false);
-		for_each_possible_cpu(cpu)
-			reqs[cpu].jfloor = 0;
+		app_mem_switch(READ_ONCE(top_uid));
 	}
 	if (tmeasure) {
 		skin_mc = temp;
@@ -822,6 +970,7 @@ static void gov_fn(struct work_struct *work)
 		else if (temp < (int)sustained_temp * 1000 - SUST_HYST_MC)
 			sustained_hot = false;
 	}
+	janks_before = fas_janks;
 	for_each_possible_cpu(cpu) {
 		struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
 
@@ -837,6 +986,7 @@ static void gov_fn(struct work_struct *work)
 		}
 		cpufreq_cpu_put(policy);
 	}
+	fas_trim(fas_janks != janks_before);
 	power_update(limit, measure, mw);
 	apply_policies(&modes[cur_mode]);
 	if (gov_needed())
@@ -1095,6 +1245,7 @@ void avr_profile_cpuset_attach(struct cgroup_subsys_state *css,
 	if (uid % 100000 <= 19999 && thread_group_leader(task) &&
 	    task->tgid != READ_ONCE(top_pid)) {
 		WRITE_ONCE(top_pid, task->tgid);
+		WRITE_ONCE(top_uid, uid);
 		WRITE_ONCE(fas_reset, true);	/* its floors were another app's */
 		queue_work(system_unbound_wq, &top_pid_work);
 	}
@@ -1320,7 +1471,7 @@ static ssize_t top_pid_show(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute top_pid_attr = __ATTR_RO(top_pid);
 
-/* "janks=<n> floors=cpu0:<kHz>,cpu6:<kHz>": frame-aware state */
+/* "janks=<n> cut=<points> floors=cpu0:<kHz>,cpu6:<kHz>": frame-aware state */
 static ssize_t frame_state_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
 {
@@ -1329,7 +1480,7 @@ static ssize_t frame_state_show(struct kobject *kobj,
 	bool first = true;
 
 	mutex_lock(&avr_lock);
-	len = sysfs_emit(buf, "janks=%u floors=", fas_janks);
+	len = sysfs_emit(buf, "janks=%u cut=%u floors=", fas_janks, fas_cut);
 	for_each_possible_cpu(cpu) {
 		if (!reqs[cpu].added)
 			continue;
