@@ -68,6 +68,8 @@
  * decrease): one point less after every 5 s with no cap-caused jank, up to
  * FAS_CUT_MAX, and FAS_CUT_BACK points back at once when our caps held a
  * frame back. Each app converges to the least headroom its frames tolerate.
+ * A floor learned in a heavy scene is released quickly once the need stays
+ * well below it for 2 s (SCENE_LIGHT_*), instead of waiting out its hold.
  * The learned floors and the trim are remembered for the last APP_MEMORY
  * apps (by UID), so returning to a game starts where it left off.
  *
@@ -102,7 +104,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.1 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.2 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -167,6 +169,7 @@ struct avr_policy_reqs {
 	s32 jfloor;		/* learned from late frames, kHz; 0 = none */
 	unsigned int jticks;	/* ticks until the floor is probed lower */
 	unsigned int jhold;	/* hold of the floor, doubles on repeat */
+	unsigned int light_ticks; /* ticks the need sat well below the floor */
 	unsigned int eff_khz;	/* most energy-efficient OPP, 0 = not known yet */
 };
 
@@ -220,6 +223,9 @@ static unsigned long last_kick;			/* jiffies of the last touch/launch */
 #define JFLOOR_HOLD_TICKS	500	/* 10 s */
 #define JFLOOR_HOLD_MAX_TICKS	6000	/* 2 min */
 #define JFLOOR_PROBE_TICKS	250	/* then 5% lower every 5 s */
+#define SCENE_LIGHT_PCT		70	/* need below this share of the floor... */
+#define SCENE_LIGHT_TICKS	100	/* ...for 2 s: the scene got lighter */
+#define SCENE_PROBE_TICKS	50	/* then probe every 1 s, hold forgotten */
 static atomic_t fas_pending = ATOMIC_INIT(0);	/* worst level since the last tick */
 static unsigned long fas_pending_at;		/* jiffies of that event */
 static unsigned int fas_janks;			/* late frames that lifted a cap */
@@ -499,16 +505,37 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 				       JFLOOR_HOLD_TICKS;
 		r->jfloor = max(r->jfloor, f);
 		r->jticks = r->jhold;
+		r->light_ticks = 0;
 		r->dcap = jank > 1 ? (s32)fmax : max(r->dcap, f);
 		r->low_ticks = 0;
 		fas_janks++;
 	} else if (r->jfloor) {
+		/*
+		 * Scene change: a floor learned in a heavy scene shouldn't keep
+		 * the clocks up once the load is clearly lighter. When the need
+		 * stays well below the floor for SCENE_LIGHT_TICKS, drop the
+		 * hold and probe down every SCENE_PROBE_TICKS; a late frame
+		 * puts the floor right back.
+		 */
+		bool light;
+
+		if ((u64)want * 100 < (u64)r->jfloor * SCENE_LIGHT_PCT) {
+			if (r->light_ticks < SCENE_LIGHT_TICKS)
+				r->light_ticks++;
+		} else {
+			r->light_ticks = 0;
+		}
+		light = r->light_ticks >= SCENE_LIGHT_TICKS;
+		if (light) {
+			r->jhold = JFLOOR_HOLD_TICKS;
+			r->jticks = min_t(unsigned int, r->jticks, SCENE_PROBE_TICKS);
+		}
 		/* frames on time: try a little lower now and then */
 		if (r->jticks) {
 			r->jticks--;
 		} else {
 			r->jfloor -= fmax / 20;
-			r->jticks = JFLOOR_PROBE_TICKS;
+			r->jticks = light ? SCENE_PROBE_TICKS : JFLOOR_PROBE_TICKS;
 			if (r->jfloor <= floor)
 				r->jfloor = 0;
 		}

@@ -133,6 +133,9 @@
 #define PROBE_MS	5000	/* then try one step lower this often... */
 #define PROBE_WORK_PCT	15	/* ...if the work fell by this much since */
 #define FLOOR_FORGET_MS	30000	/* idle this long: the game is gone */
+#define SCENE_LIGHT_PCT	70	/* work below this share of the floor's... */
+#define SCENE_LIGHT_N	2	/* ...for this many readings: a lighter scene */
+#define SCENE_PROBE_MS	1000	/* then probe every second, hold forgotten */
 #define VERIFY_READINGS	2	/* readings after a fall that must look right */
 #define VERIFY_MARGIN	8	/* busy points above the proportional estimate */
 #define MAX_STEPS	64
@@ -180,6 +183,8 @@ static int floor_i;		/* 0 = none */
 static long floor_until;	/* hold the floor until then (ms) */
 static long floor_hold = FLOOR_HOLD_MS;
 static long floor_work;		/* busy% x MHz when the floor was learned */
+static long floor_peak_work;	/* ...at the last jank or saturation, not probes */
+static int light_n;		/* readings in a row well below floor_peak_work */
 static long idle_since = -1;	/* when the GPU went nearly idle (ms) */
 
 /* frame timing (encore_fas) */
@@ -460,6 +465,8 @@ static void floor_learn(int c, long work, long t)
 		floor_i = f;
 	floor_until = t + floor_hold;
 	floor_work = work;
+	floor_peak_work = work;
+	light_n = 0;
 }
 
 /*
@@ -484,10 +491,24 @@ static void floor_age(long busy, long work, long t)
 		return;
 	}
 	idle_since = -1;
+	/*
+	 * Scene change: well below the work the floor was learned at for a
+	 * couple of readings - don't wait out the hold, probe every second.
+	 */
+	if (floor_i && work * 100 <= floor_peak_work * SCENE_LIGHT_PCT)
+		light_n++;
+	else
+		light_n = 0;
+	if (light_n >= SCENE_LIGHT_N) {
+		floor_hold = FLOOR_HOLD_MS;
+		if (floor_until > t + SCENE_PROBE_MS)
+			floor_until = t;
+	}
 	if (floor_i && t >= floor_until &&
-	    (work * 100 <= floor_work * (100 - PROBE_WORK_PCT) || frames_ok(t))) {
+	    (light_n >= SCENE_LIGHT_N ||
+	     work * 100 <= floor_work * (100 - PROBE_WORK_PCT) || frames_ok(t))) {
 		floor_i--;
-		floor_until = t + PROBE_MS;
+		floor_until = t + (light_n >= SCENE_LIGHT_N ? SCENE_PROBE_MS : PROBE_MS);
 		floor_work = work;
 		if (!floor_i)
 			floor_hold = FLOOR_HOLD_MS;
@@ -837,6 +858,8 @@ static void app_mem_switch(long uid)
 	floor_i = 0;
 	floor_hold = FLOOR_HOLD_MS;
 	floor_work = 0;
+	floor_peak_work = 0;
+	light_n = 0;
 	cut = CUT_START;
 	cut_since = t;
 	for (i = 0; uid >= 0 && i < APP_MEMORY; i++) {
@@ -845,6 +868,7 @@ static void app_mem_switch(long uid)
 		floor_i = app_mem[i].floor_i < nsteps ? app_mem[i].floor_i : 0;
 		floor_hold = app_mem[i].floor_hold;
 		floor_work = app_mem[i].floor_work;
+		floor_peak_work = floor_work;
 		cut = app_mem[i].cut;
 		app_mem[i].used = t;
 		/* a fresh hold: the scene may differ from when it was saved */
