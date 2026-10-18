@@ -142,7 +142,8 @@
 #define RESCAN_MS	5000	/* look at top-app this often anyway */
 #define MAX_LISTENERS	8
 #define PRIMARY_IDLE_MS	1000	/* another app's frames take over after this */
-#define JANK_BOUND_PCT	90	/* the GPU ran this close to the cap: it held the frame */
+#define JANK_BOUND_PCT	90	/* the GPU ran this close to the cap... */
+#define JANK_BUSY_PCT	80	/* ...and was this busy: then the cap held the frame */
 #define FAS_STATE_MS	2000	/* write fas_state at most this often */
 #define FAS_TOUCH_HEADROOM_MIN 30	/* touched floor of the trim, see TOUCH_HEADROOM_MIN */
 #define FAS_HEADROOM_MIN 10	/* untouched floor of the trim */
@@ -617,8 +618,12 @@ static void gov_jank(int level, long t)
 {
 	if (!g.active || g.cap < 0 || g.cap >= nsteps - 1)
 		return;
-	/* only if the GPU ran into the cap; otherwise the cap didn't do it */
-	if (g.last_clk * 100 < steps[g.cap] * JANK_BOUND_PCT)
+	/*
+	 * Only if the GPU ran into the cap and was busy doing so; a game's own
+	 * hitches (loading, shader compiles) happen with the GPU at its cap but
+	 * idle, and raising the cap for them only costs power.
+	 */
+	if (g.last_clk * 100 < steps[g.cap] * JANK_BOUND_PCT || g.last_busy < JANK_BUSY_PCT)
 		return;
 	floor_learn(g.cap, g.work, t);
 	/* the cap held a frame back: give headroom back at once */

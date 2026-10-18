@@ -100,7 +100,7 @@
 #include <linux/workqueue.h>
 #include <linux/writeback.h>
 
-#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.0 (avr, KernelSU-Next)"
+#define RAKKASHIN_VERSION	"Rakkashin Kernel v3.0.1 (avr, KernelSU-Next)"
 
 extern int sched_pelt_set_multiplier(unsigned int mult);
 extern unsigned long rk_cpu_util(int cpu);
@@ -161,6 +161,7 @@ struct avr_policy_reqs {
 				   DCAP_TOP = start from the top (touch) */
 	unsigned int low_ticks;	/* consecutive ticks the need sat well below dcap */
 	unsigned int bound_age;	/* ticks since a CPU last ran at dcap */
+	unsigned int sat_age;	/* ticks since a CPU was saturated at the limit */
 	s32 jfloor;		/* learned from late frames, kHz; 0 = none */
 	unsigned int jticks;	/* ticks until the floor is probed lower */
 	unsigned int jhold;	/* hold of the floor, doubles on repeat */
@@ -424,14 +425,17 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 	cur = r->dcap ? r->dcap : (s32)fmax;
 	/* the limit actually in force, which may be below our own cap */
 	limit = min_t(s32, cur, READ_ONCE(policy->max));
-	if (!r->dcap)			/* fresh start: never ran at a cap yet */
+	if (!r->dcap) {
+		/* fresh start: never ran at a cap yet */
 		r->bound_age = UINT_MAX;
-	/* our cap (not thermal or another limit) is what the CPUs ran into */
-	else if (r->dcap && r->dcap < (s32)fmax && cur <= (s32)READ_ONCE(policy->max) &&
-	    (u64)khz * 100 >= (u64)cur * 95)
+		r->sat_age = UINT_MAX;
+	} else if (r->dcap < (s32)fmax && cur <= (s32)READ_ONCE(policy->max) &&
+		   (u64)khz * 100 >= (u64)cur * 95) {
+		/* our cap (not thermal or another limit) is what the CPUs ran into */
 		r->bound_age = 0;
-	else if (r->bound_age < UINT_MAX)
+	} else if (r->bound_age < UINT_MAX) {
 		r->bound_age++;
+	}
 
 	for_each_cpu(cpu, policy->cpus) {
 		unsigned long cap = max(arch_scale_cpu_capacity(cpu), 1UL);
@@ -463,10 +467,21 @@ static void demand_update(struct cpufreq_policy *policy, unsigned int jank)
 			   min_t(unsigned int, headroom, FAS_HEADROOM_MIN);
 	want = clamp_t(s32, need * (100 + headroom) / 100, floor, fmax);
 
-	/* a late frame while this cap held the CPUs back: lift, remember */
+	if (saturated && r->bound_age == 0)
+		r->sat_age = 0;
+	else if (r->sat_age < UINT_MAX)
+		r->sat_age++;
+
+	/*
+	 * A late frame while this cap held the CPUs back: a CPU was running at
+	 * our cap *and* busy for the whole tick (running at the cap alone is
+	 * normal in a game, and its own hitches - shader compiles, loading -
+	 * aren't ours). Lift, and raise the floor in small steps so it settles
+	 * at the least that keeps frames on time.
+	 */
 	if (jank && r->dcap && r->dcap < (s32)fmax &&
-	    r->bound_age <= JANK_BOUND_TICKS) {
-		s32 f = min_t(s32, fmax, r->dcap + fmax / (jank > 1 ? 5 : 10));
+	    r->sat_age <= JANK_BOUND_TICKS) {
+		s32 f = min_t(s32, fmax, r->dcap + fmax / (jank > 1 ? 10 : 20));
 
 		r->jhold = r->jfloor ? min_t(unsigned int, r->jhold * 2,
 					     JFLOOR_HOLD_MAX_TICKS) :
@@ -986,6 +1001,7 @@ static void gov_fn(struct work_struct *work)
 			else {
 				reqs[cpu].dcap = 0;	/* re-measure when capping resumes */
 				reqs[cpu].bound_age = UINT_MAX;
+				reqs[cpu].sat_age = UINT_MAX;
 			}
 		}
 		cpufreq_cpu_put(policy);
