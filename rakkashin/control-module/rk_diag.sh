@@ -73,6 +73,7 @@ for f in gpu_freq_table gpu_min_clock gpu_max_clock gpu_clock gpu_busy; do
 done
 echo "rk_gpud: $(pgrep -f rk_gpud || echo 'not running')"
 echo "encore_fas: $([ -e /dev/encore_fas ] && echo present || echo missing)"
+echo "kgsl: idle_timer=$(cat /sys/class/kgsl/kgsl-3d0/idle_timer 2>&1) wake_timeout=$(cat /sys/class/kgsl/kgsl-3d0/wake_timeout 2>&1)"
 TP=$(cat $K/top_pid 2>/dev/null)
 echo "top app: $(tr '\0' ' ' < "/proc/$TP/cmdline" 2>/dev/null | cut -c1-80) (pid $TP)"
 echo "libgui probed: inode $(stat -c '%i' /system/lib64/libgui.so 2>&1)"

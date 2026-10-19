@@ -94,6 +94,34 @@ performance|game|extreme) core_ctl all ;;
 *) core_ctl stock ;;
 esac
 
+# kgsl (GPU driver) power timers, from LawRun/AGNi: idle_timer is how long
+# the GPU stays up after its last work before slumbering (stock 80 ms;
+# LawRun used 58, AGNi 64), wake_timeout how long a touch keeps a woken GPU
+# up waiting for a frame (stock 100 ms). Shorter saves power in bursty UI;
+# the fast profiles keep the stock values. Stock values are saved once.
+KG=/sys/class/kgsl/kgsl-3d0
+KGSAVED=$STATE/kgsl_defaults
+if [ ! -s "$KGSAVED" ]; then
+	for k in idle_timer wake_timeout; do
+		[ -r "$KG/$k" ] && echo "$k $(cat "$KG/$k")"
+	done > "$KGSAVED"
+fi
+kgsl_set() {	# <idle_timer ms> <wake_timeout ms>, or "stock"
+	while read -r k v; do
+		case "$1:$k" in
+		stock:*) ;;
+		*:idle_timer) v=$1 ;;
+		*:wake_timeout) v=$2 ;;
+		esac
+		[ -w "$KG/$k" ] && echo "$v" > "$KG/$k"
+	done < "$KGSAVED"
+}
+case "$MODE" in
+battery) kgsl_set 50 50 ;;
+balanced) kgsl_set 64 80 ;;
+*) kgsl_set stock ;;
+esac
+
 case "$MODE" in
 balanced)
 	# background work runs on lower, more efficient frequencies; the
